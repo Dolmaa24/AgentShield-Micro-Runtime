@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/shellguard-parse", "crates/shellguard-policy", "crates/shellguard-gate"]
+
+# Every crate here has zero external dependencies. That is a deliberate
+# constraint, not an accident of scope: this library is a security boundary
+# that runs on the critical path of an autonomous agent. A transitive
+# dependency tree is an unaudited code-execution surface inside the thing
+# whose entire job is to stop unaudited code execution. See DESIGN.md § 9.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "Apache-2.0"
+repository = "https://github.com/Dolmaa24/agent-sandbox"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+# The gate is on the hot path of every command an agent runs. Optimise it in
+# dev builds too, otherwise the latency numbers people measure locally are
+# meaningless and they tune against the wrong bottleneck.
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

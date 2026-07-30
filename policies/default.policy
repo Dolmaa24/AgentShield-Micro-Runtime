@@ -1,0 +1,472 @@
+# shellguard default policy
+#
+# Read this top to bottom before changing it. Two properties are load-bearing:
+#
+#   1. Verdicts combine by severity, not by order. A command matching both an
+#      `allow` rule and a `deny` rule is denied. There is no precedence to
+#      reason about, so no broad allow can accidentally outrank a narrow deny.
+#
+#   2. The default is `confine`, not `allow`. "No rule matched" means the
+#      ruleset had nothing to say about this command, which for agent-authored
+#      input is the common case, not evidence of safety.
+#
+# Rules deny only where a legitimate agent workflow has no reason to go. Where
+# a real workflow does go, the verdict is `confine` or `ask`, because a ruleset
+# that blocks ordinary work is a ruleset that gets switched off, and a gate
+# that is switched off has a true-positive rate of zero.
+
+version 1
+default confine
+
+# ---------------------------------------------------------------------------
+# Opacity: commands that cannot be read
+#
+# These come first because they bound what every rule below can claim. Rules
+# key on program identity; when the program is computed at runtime, no rule
+# keyed on identity applies, and "matched no deny rule" would otherwise be
+# silently treated as "safe".
+# ---------------------------------------------------------------------------
+
+rule opacity.computed-program deny
+  reason the program name is computed at runtime, so no rule keyed on program identity applies to this command
+  opacity-at-least opaque
+  cap shell.escape
+end
+
+# Weaker than the rule above, and deliberately so. A program name from a
+# variable is equally unjudgeable, but `$EDITOR file` and `$PYTHON script.py`
+# are ordinary; denying them outright is how a gate gets switched off. An
+# opaque name also matches this rule, and the two verdicts join to `deny`.
+rule opacity.indirect-program ask
+  reason the program name comes from a variable, so it cannot be identified before it runs
+  opacity-at-least indirect
+  cap proc.spawn
+end
+
+rule shell.eval-computed deny
+  reason eval runs text assembled at runtime, which cannot be inspected before it runs
+  program eval source .
+  taint-at-least variable
+  cap shell.escape
+end
+
+rule shell.eval-literal ask
+  reason eval executes its argument as shell code
+  program eval
+  cap shell.escape
+end
+
+rule shell.interpreter-c-computed deny
+  reason a shell invoked with -c on computed text hides the real command from inspection
+  program sh bash zsh dash ksh fish
+  arg-prefix -c
+  taint-at-least variable
+  cap shell.escape
+end
+
+rule shell.interpreter-inline ask
+  reason inline interpreter code can reach the shell through system() and equivalents
+  program python python3 perl ruby node deno php lua
+  any
+    arg-eq -c -e --eval --exec
+    arg-prefix -e
+  end-any
+  cap shell.escape
+end
+
+rule shell.awk-system deny
+  reason awk system() executes a shell command
+  program awk gawk mawk nawk
+  arg-contains system(
+  cap shell.escape
+end
+
+# Deliberately `ask` rather than `deny`: a pipe to or from getline is how awk
+# does perfectly ordinary work, and denying it outright is the kind of rule
+# that gets the whole gate disabled.
+rule shell.awk-pipe ask
+  reason awk can run a command through a pipe to or from getline
+  program awk gawk mawk nawk
+  any
+    arg-contains | getline
+    arg-contains |getline
+    arg-contains print |
+  end-any
+  cap shell.escape
+end
+
+# tar, rsync and friends take options whose values are commands. These are the
+# classic argv-laundering paths: the program is on nobody's dangerous list.
+rule shell.option-is-a-command deny
+  reason this option's value is executed as a command
+  any
+    arg-prefix --checkpoint-action
+    arg-prefix --to-command
+    arg-prefix --use-compress-program
+    arg-prefix --rsh-command
+    arg-prefix --remote-shell
+    arg-prefix --ssh-command
+    arg-prefix ProxyCommand
+    arg-prefix LocalCommand
+  end-any
+  cap shell.escape
+end
+
+rule shell.preload-injection deny
+  reason a preload variable injects a library into every process the command starts
+  any
+    assigns LD_PRELOAD DYLD_INSERT_LIBRARIES LD_AUDIT DYLD_LIBRARY_PATH
+    text-contains LD_PRELOAD DYLD_INSERT_LIBRARIES
+  end-any
+  cap shell.escape
+end
+
+# ---------------------------------------------------------------------------
+# Fetch-and-execute
+# ---------------------------------------------------------------------------
+
+rule net.pipe-to-interpreter deny
+  reason downloads code and executes it in one step, so nothing is ever inspectable
+  program curl wget fetch
+  pipes-into sh bash zsh dash ksh python python3 perl ruby node php
+  cap net.connect shell.escape
+end
+
+rule shell.decode-to-interpreter deny
+  reason decoded data piped into an interpreter is code that never appeared in the command
+  program base64 xxd uudecode openssl
+  pipes-into sh bash zsh dash python python3 perl ruby node
+  cap shell.escape
+end
+
+rule net.reverse-shell deny
+  reason opens an interactive shell over a network connection
+  program nc ncat netcat socat
+  any
+    arg-prefix -e
+    arg-contains exec:
+    arg-contains /bin/sh
+    arg-contains /bin/bash
+  end-any
+  cap net.connect shell.escape
+end
+
+# ---------------------------------------------------------------------------
+# Destructive filesystem operations
+#
+# Framed by where the path points rather than by enumerating dangerous paths.
+# An enumeration is always incomplete, and `rm -rf $HOME/work` is not made safe
+# by not being on a list.
+# ---------------------------------------------------------------------------
+
+rule destructive.rm-recursive-outside deny
+  reason recursive delete targeting a path outside the workspace
+  program rm
+  short-flag r
+  path-outside-workspace
+  cap fs.delete
+end
+
+rule destructive.rm-recursive-unresolved ask
+  reason recursive delete of a path that cannot be determined before the command runs
+  program rm
+  short-flag r
+  unresolved-path
+  cap fs.delete
+end
+
+rule destructive.rm-force-outside ask
+  reason forced delete outside the workspace
+  program rm
+  short-flag f
+  path-outside-workspace
+  cap fs.delete
+end
+
+rule destructive.find-delete ask
+  reason find -delete removes every matching file without confirmation
+  program find
+  arg-eq -delete
+  cap fs.delete
+end
+
+rule destructive.truncate-outside deny
+  reason a shell redirection truncates a file outside the workspace
+  write-redirect-outside
+  cap fs.write
+end
+
+rule destructive.write-system-path deny
+  reason writes to a path owned by the operating system
+  write-target-prefix /etc/ /usr/ /bin/ /sbin/ /boot/ /System/ /Library/ /var/db/ /private/etc/
+  cap fs.write
+end
+
+rule perms.recursive-outside deny
+  reason recursive ownership or permission change outside the workspace
+  program chmod chown chgrp
+  short-flag R
+  path-outside-workspace
+  cap fs.write
+end
+
+rule perms.world-writable ask
+  reason grants write permission to every user on the machine
+  program chmod
+  arg-eq 777 0777 a+w o+w
+  cap fs.write
+end
+
+rule device.raw-write deny
+  reason writing a raw device destroys whatever filesystem is on it
+  program dd
+  arg-prefix of=/dev/ of=/private/dev/
+  cap device.write
+end
+
+rule device.format deny
+  reason formats, partitions or erases a disk
+  program mkfs fdisk parted diskutil newfs_hfs newfs_apfs sgdisk wipefs shred
+  cap device.write
+end
+
+# ---------------------------------------------------------------------------
+# Privilege and kernel
+# ---------------------------------------------------------------------------
+
+rule priv.escalation ask
+  reason runs as another user, outside the uid the sandbox confines the agent to
+  program sudo su doas pkexec
+  cap priv.esc
+end
+
+rule kernel.module deny
+  reason loading kernel code steps outside every userspace confinement
+  program insmod rmmod modprobe kextload kextunload kmutil
+  cap kernel.module
+end
+
+rule sandbox.namespace-escape deny
+  reason manipulates namespaces or the root directory, which is how a process leaves its confinement
+  program nsenter unshare chroot setns
+  cap sandbox.escape
+end
+
+rule sandbox.container-control ask
+  reason the container daemon runs commands outside the agent's sandbox
+  program docker podman nerdctl kubectl
+  cap sandbox.escape proc.spawn
+end
+
+# ---------------------------------------------------------------------------
+# Credentials and secrets
+# ---------------------------------------------------------------------------
+
+rule cred.system-password-db deny
+  reason reads the system password or privilege database
+  arg-contains /etc/shadow /etc/sudoers /etc/master.passwd /etc/gshadow
+  cap cred.access
+end
+
+rule cred.private-material ask
+  reason reads private key or cloud credential material
+  any
+    arg-contains /.ssh/id_
+    arg-contains /.aws/credentials
+    arg-contains /.config/gcloud
+    arg-contains /.kube/config
+    arg-contains /.netrc
+    arg-contains /.docker/config.json
+    arg-contains /.gnupg/
+    arg-suffix .pem .p12 .pfx .key
+  end-any
+  cap cred.access
+end
+
+rule cred.keychain ask
+  reason reads the platform credential store
+  program security keyctl secret-tool
+  cap cred.access
+end
+
+# ---------------------------------------------------------------------------
+# Version control
+#
+# An agent losing a day of uncommitted work is the failure people actually hit,
+# and it does not require anything malicious to happen.
+# ---------------------------------------------------------------------------
+
+rule vcs.reset-hard ask
+  reason discards uncommitted work with no way to recover it
+  program git
+  subcommand reset
+  arg-eq --hard
+  cap vcs.rewrite fs.write
+end
+
+rule vcs.clean-force ask
+  reason deletes untracked files, including ones never committed anywhere
+  program git
+  subcommand clean
+  short-flag f
+  cap fs.delete
+end
+
+rule vcs.checkout-discard ask
+  reason overwrites local modifications from the index
+  program git
+  subcommand checkout restore
+  any
+    arg-eq --force --hard
+    arg-eq .
+  end-any
+  cap fs.write
+end
+
+rule vcs.force-push deny
+  reason force-push rewrites history that other people have already pulled
+  program git
+  subcommand push
+  any
+    arg-eq --force -f
+    arg-prefix --force-with-lease
+  end-any
+  cap vcs.rewrite net.connect
+end
+
+rule vcs.history-rewrite ask
+  reason rewrites commit history
+  program git
+  subcommand rebase filter-branch filter-repo
+  cap vcs.rewrite
+end
+
+# git config keys whose values name a program. Setting one turns an ordinary
+# later `git` invocation into arbitrary execution, which makes this a delayed
+# shell escape rather than a configuration change.
+rule vcs.config-executes ask
+  reason this git config key names a program that later git commands will run
+  program git
+  subcommand config
+  any
+    arg-contains core.pager
+    arg-contains core.editor
+    arg-contains core.sshCommand
+    arg-contains core.fsmonitor
+    arg-contains diff.external
+    arg-contains credential.helper
+    arg-contains protocol.ext
+    arg-contains uploadpack
+    arg-contains receivepack
+    arg-prefix filter.
+  end-any
+  cap shell.escape
+end
+
+# ---------------------------------------------------------------------------
+# Persistence and anti-forensics
+# ---------------------------------------------------------------------------
+
+# Matched on command text rather than resolved targets, because the paths that
+# matter here are reached as often through `$HOME/.zshrc` as through a literal,
+# and a rule that only catches the literal form catches nothing.
+rule persist.startup-file ask
+  reason modifies a file that runs automatically at login or boot
+  text-contains .bashrc .zshrc .profile .bash_profile .zshenv LaunchAgents LaunchDaemons systemd/system .config/autostart
+  cap fs.write
+end
+
+rule persist.scheduler ask
+  reason installs a job that runs without the agent being invoked again
+  program crontab launchctl systemctl at batch schtasks
+  cap fs.write proc.spawn
+end
+
+rule audit.tamper-delete deny
+  reason deletes shell history or system logs, which is only useful for hiding what ran
+  program rm truncate shred srm
+  arg-contains .bash_history .zsh_history /var/log /var/audit
+  cap fs.delete
+end
+
+rule audit.tamper-overwrite deny
+  reason truncates shell history or system logs, which is only useful for hiding what ran
+  write-redirect
+  text-contains .bash_history .zsh_history /var/log /var/audit
+  cap fs.write
+end
+
+rule integrity.self-tamper deny
+  reason modifies the sandbox's own policy or audit trail
+  arg-contains .shellguard shellguard.policy
+  cap fs.write
+end
+
+# ---------------------------------------------------------------------------
+# Availability
+# ---------------------------------------------------------------------------
+
+rule dos.fork-bomb deny
+  reason a self-invoking recursive function exhausts the process table
+  text-contains :(){:|:&};: :(){ :|:& };:
+  cap proc.spawn
+end
+
+# Matched on the *last* argument, because that is the operand. `kill -1 4242`
+# sends SIGHUP to one process; `kill -9 -1` signals every process the user
+# owns, and the two differ only in where the -1 sits.
+rule dos.signal-every-process deny
+  reason a target of -1 signals every process the user owns, including the agent's own supervisor
+  program kill
+  arg-last -1
+  cap proc.signal
+end
+
+# ---------------------------------------------------------------------------
+# Package managers
+#
+# Not suspicious, but install hooks are arbitrary code execution by design, so
+# these belong inside the sandbox rather than outside it.
+# ---------------------------------------------------------------------------
+
+rule pkg.install confine
+  reason package installation runs build and lifecycle scripts from the package itself
+  program npm yarn pnpm pip pip3 gem cargo bundle go composer brew apt apt-get yum dnf pacman
+  subcommand install add i get
+  cap pkg.install net.connect shell.escape
+end
+
+rule pkg.global-install ask
+  reason installs outside the workspace, so the effect outlives the sandbox
+  program npm yarn pnpm pip pip3 gem
+  any
+    arg-eq -g --global --user
+    arg-prefix --prefix
+  end-any
+  cap pkg.install
+end
+
+# ---------------------------------------------------------------------------
+# Read-only work
+#
+# The point of this section is throughput. Most of what an agent runs is
+# inspection, and paying sandbox entry for `git status` is how a gate acquires
+# a reputation for being slow.
+# ---------------------------------------------------------------------------
+
+rule safe.inspection allow
+  reason read-only inspection confined to the workspace
+  program ls pwd echo cat head tail wc grep egrep fgrep rg find file stat basename dirname date true false printf sort uniq cut sed awk diff which type id uname hostname
+  not path-outside-workspace
+  not write-redirect
+  not unresolved-path
+  cap fs.read
+end
+
+rule safe.vcs-inspection allow
+  reason read-only version control inspection
+  program git
+  subcommand status log diff show branch remote describe rev-parse blame shortlog tag
+  not write-redirect
+  cap fs.read
+end

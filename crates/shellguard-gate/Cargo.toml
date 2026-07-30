@@ -1,0 +1,15 @@
+[package]
+name = "shellguard-gate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The pre-execution decision path: resolve, unwrap, evaluate, decide"
+
+[dependencies]
+shellguard-parse = { path = "../shellguard-parse" }
+shellguard-policy = { path = "../shellguard-policy" }
+
+[lints]
+workspace = true

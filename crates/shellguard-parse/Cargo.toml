@@ -1,0 +1,13 @@
+[package]
+name = "shellguard-parse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bash syntax tree with a taint lattice, for security analysis of untrusted commands"
+
+[dependencies]
+
+[lints]
+workspace = true
