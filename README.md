@@ -3,6 +3,9 @@
 Decide whether an AI agent's shell command should run — then confine whatever
 you let through.
 
+> The **AgentShield Micro-Runtime** project. `shellguard` is the library and
+> the command it ships; the repository is the project around them.
+
 ```
 $ shellguard eval -w ~/project 'find . -name "*.log" -exec rm -rf /etc {} \;'
 DENY  find . -name "*.log" -exec rm -rf /etc {} \;
