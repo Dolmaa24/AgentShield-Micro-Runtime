@@ -24,6 +24,7 @@ USAGE:
 
 OPTIONS:
     -w, --workspace DIR    the directory the agent may write to (default: cwd)
+    -C, --cwd DIR          resolve relative paths against this (default: the workspace)
     -p, --policy FILE      a policy file (default: the built-in ruleset)
     -d, --deadline MS      evaluation budget in milliseconds (default: 10)
     -n, --iterations N     bench iterations over the corpus (default: 200)
@@ -49,6 +50,7 @@ fn main() -> ExitCode {
 #[derive(Default)]
 struct Opts {
     workspace: Option<PathBuf>,
+    cwd: Option<PathBuf>,
     policy: Option<PathBuf>,
     deadline_ms: Option<u64>,
     iterations: Option<usize>,
@@ -98,6 +100,7 @@ fn parse_opts(args: impl Iterator<Item = String>) -> Result<Opts, String> {
         };
         match a.as_str() {
             "-w" | "--workspace" => o.workspace = Some(PathBuf::from(take("--workspace")?)),
+            "-C" | "--cwd" => o.cwd = Some(PathBuf::from(take("--cwd")?)),
             "-p" | "--policy" => o.policy = Some(PathBuf::from(take("--policy")?)),
             "-d" | "--deadline" => {
                 let v = take("--deadline")?;
@@ -127,6 +130,12 @@ fn build_gate(o: &Opts) -> Result<Gate, String> {
         None => std::env::current_dir().map_err(|e| format!("cannot read cwd: {e}"))?,
     };
     let mut cfg = GateConfig::from_env(&workspace);
+    // The working directory defaults to the workspace, not to wherever the
+    // caller happens to be standing. An agent runs its commands inside its
+    // workspace, so resolving `./build` against the caller's shell would make
+    // ordinary relative paths look like escapes — a confusing denial, and the
+    // kind that teaches people to stop trusting the tool.
+    cfg.cwd = o.cwd.clone().unwrap_or(workspace);
     if let Some(ms) = o.deadline_ms {
         cfg.deadline = Duration::from_millis(ms);
     }
