@@ -1,0 +1,14 @@
+[package]
+name = "shellguard-enforce"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Kernel-level confinement: Seatbelt on macOS, seccomp-BPF and Landlock on Linux"
+
+[dependencies]
+shellguard-policy = { path = "../shellguard-policy" }
+
+[lints]
+workspace = true

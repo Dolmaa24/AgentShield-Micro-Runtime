@@ -3,6 +3,13 @@
 version = 3
 
 [[package]]
+name = "shellguard-enforce"
+version = "0.1.0"
+dependencies = [
+ "shellguard-policy",
+]
+
+[[package]]
 name = "shellguard-gate"
 version = "0.1.0"
 dependencies = [
