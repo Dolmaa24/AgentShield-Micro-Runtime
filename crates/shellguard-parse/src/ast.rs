@@ -468,22 +468,67 @@ pub enum Node {
     Simple(Simple),
     /// `a | b | c`. `stderr_piped[i]` records whether the pipe after command
     /// `i` was `|&`.
-    Pipeline { negated: bool, commands: Vec<Node>, stderr_piped: Vec<bool>, span: Span },
-    List { items: Vec<ListItem>, span: Span },
+    Pipeline {
+        negated: bool,
+        commands: Vec<Node>,
+        stderr_piped: Vec<bool>,
+        span: Span,
+    },
+    List {
+        items: Vec<ListItem>,
+        span: Span,
+    },
     /// `( ... )` — runs in a child shell.
-    Subshell { body: Box<Node>, redirects: Vec<Redirect>, span: Span },
+    Subshell {
+        body: Box<Node>,
+        redirects: Vec<Redirect>,
+        span: Span,
+    },
     /// `{ ...; }` — runs in the current shell.
-    Group { body: Box<Node>, redirects: Vec<Redirect>, span: Span },
-    If { cond: Box<Node>, then: Box<Node>, otherwise: Option<Box<Node>>, span: Span },
-    For { var: String, words: Vec<Word>, body: Box<Node>, span: Span },
+    Group {
+        body: Box<Node>,
+        redirects: Vec<Redirect>,
+        span: Span,
+    },
+    If {
+        cond: Box<Node>,
+        then: Box<Node>,
+        otherwise: Option<Box<Node>>,
+        span: Span,
+    },
+    For {
+        var: String,
+        words: Vec<Word>,
+        body: Box<Node>,
+        span: Span,
+    },
     /// `while` / `until`
-    Loop { until: bool, cond: Box<Node>, body: Box<Node>, span: Span },
-    Case { word: Word, arms: Vec<CaseArm>, span: Span },
-    Function { name: String, body: Box<Node>, span: Span },
+    Loop {
+        until: bool,
+        cond: Box<Node>,
+        body: Box<Node>,
+        span: Span,
+    },
+    Case {
+        word: Word,
+        arms: Vec<CaseArm>,
+        span: Span,
+    },
+    Function {
+        name: String,
+        body: Box<Node>,
+        span: Span,
+    },
     /// `[[ ... ]]`. Its words can contain substitutions, which still run.
-    Cond { words: Vec<Word>, span: Span },
+    Cond {
+        words: Vec<Word>,
+        span: Span,
+    },
     /// `(( ... ))`
-    Arith { text: String, span: Span },
+    Arith {
+        text: String,
+        span: Span,
+    },
 }
 
 impl Node {
@@ -626,9 +671,7 @@ fn walk_word<'a, F: FnMut(CommandRef<'a>)>(w: &'a Word, ctx: Context, f: &mut F)
     let sub = Context { depth: ctx.depth + 1, in_substitution: true, nested: true, ..ctx };
     for part in &w.parts {
         match part {
-            WordPart::CommandSub { node, .. } | WordPart::ProcSub { node, .. } => {
-                node.walk(sub, f)
-            }
+            WordPart::CommandSub { node, .. } | WordPart::ProcSub { node, .. } => node.walk(sub, f),
             _ => {}
         }
     }

@@ -157,47 +157,269 @@ pub const DENIED: &[&str] = &[
 fn syscall_number(name: &str, arch: u32) -> Option<u32> {
     let x86_64 = arch == AUDIT_ARCH_X86_64;
     Some(match name {
-        "ptrace" => if x86_64 { 101 } else { 117 },
-        "process_vm_readv" => if x86_64 { 310 } else { 270 },
-        "process_vm_writev" => if x86_64 { 311 } else { 271 },
-        "mount" => if x86_64 { 165 } else { 40 },
-        "umount2" => if x86_64 { 166 } else { 39 },
-        "pivot_root" => if x86_64 { 155 } else { 41 },
-        "chroot" => if x86_64 { 161 } else { 51 },
-        "init_module" => if x86_64 { 175 } else { 105 },
-        "finit_module" => if x86_64 { 313 } else { 273 },
-        "delete_module" => if x86_64 { 176 } else { 106 },
-        "kexec_load" => if x86_64 { 246 } else { 104 },
-        "kexec_file_load" => if x86_64 { 320 } else { 294 },
-        "bpf" => if x86_64 { 321 } else { 280 },
-        "unshare" => if x86_64 { 272 } else { 97 },
-        "setns" => if x86_64 { 308 } else { 268 },
+        "ptrace" => {
+            if x86_64 {
+                101
+            } else {
+                117
+            }
+        }
+        "process_vm_readv" => {
+            if x86_64 {
+                310
+            } else {
+                270
+            }
+        }
+        "process_vm_writev" => {
+            if x86_64 {
+                311
+            } else {
+                271
+            }
+        }
+        "mount" => {
+            if x86_64 {
+                165
+            } else {
+                40
+            }
+        }
+        "umount2" => {
+            if x86_64 {
+                166
+            } else {
+                39
+            }
+        }
+        "pivot_root" => {
+            if x86_64 {
+                155
+            } else {
+                41
+            }
+        }
+        "chroot" => {
+            if x86_64 {
+                161
+            } else {
+                51
+            }
+        }
+        "init_module" => {
+            if x86_64 {
+                175
+            } else {
+                105
+            }
+        }
+        "finit_module" => {
+            if x86_64 {
+                313
+            } else {
+                273
+            }
+        }
+        "delete_module" => {
+            if x86_64 {
+                176
+            } else {
+                106
+            }
+        }
+        "kexec_load" => {
+            if x86_64 {
+                246
+            } else {
+                104
+            }
+        }
+        "kexec_file_load" => {
+            if x86_64 {
+                320
+            } else {
+                294
+            }
+        }
+        "bpf" => {
+            if x86_64 {
+                321
+            } else {
+                280
+            }
+        }
+        "unshare" => {
+            if x86_64 {
+                272
+            } else {
+                97
+            }
+        }
+        "setns" => {
+            if x86_64 {
+                308
+            } else {
+                268
+            }
+        }
         "clone3" => 435,
-        "perf_event_open" => if x86_64 { 298 } else { 241 },
-        "keyctl" => if x86_64 { 250 } else { 219 },
-        "add_key" => if x86_64 { 248 } else { 217 },
-        "request_key" => if x86_64 { 249 } else { 218 },
+        "perf_event_open" => {
+            if x86_64 {
+                298
+            } else {
+                241
+            }
+        }
+        "keyctl" => {
+            if x86_64 {
+                250
+            } else {
+                219
+            }
+        }
+        "add_key" => {
+            if x86_64 {
+                248
+            } else {
+                217
+            }
+        }
+        "request_key" => {
+            if x86_64 {
+                249
+            } else {
+                218
+            }
+        }
         "io_uring_setup" => 425,
         "io_uring_enter" => 426,
         "io_uring_register" => 427,
-        "userfaultfd" => if x86_64 { 323 } else { 282 },
-        "name_to_handle_at" => if x86_64 { 303 } else { 264 },
-        "open_by_handle_at" => if x86_64 { 304 } else { 265 },
-        "reboot" => if x86_64 { 169 } else { 142 },
-        "swapon" => if x86_64 { 167 } else { 224 },
-        "swapoff" => if x86_64 { 168 } else { 225 },
-        "syslog" => if x86_64 { 103 } else { 116 },
-        "acct" => if x86_64 { 163 } else { 89 },
-        "quotactl" => if x86_64 { 179 } else { 60 },
-        "setuid" => if x86_64 { 105 } else { 146 },
-        "setgid" => if x86_64 { 106 } else { 144 },
-        "setreuid" => if x86_64 { 113 } else { 145 },
-        "setregid" => if x86_64 { 114 } else { 143 },
-        "setresuid" => if x86_64 { 117 } else { 147 },
-        "setresgid" => if x86_64 { 119 } else { 149 },
-        "setfsuid" => if x86_64 { 122 } else { 151 },
-        "setfsgid" => if x86_64 { 123 } else { 152 },
-        "personality" => if x86_64 { 135 } else { 92 },
+        "userfaultfd" => {
+            if x86_64 {
+                323
+            } else {
+                282
+            }
+        }
+        "name_to_handle_at" => {
+            if x86_64 {
+                303
+            } else {
+                264
+            }
+        }
+        "open_by_handle_at" => {
+            if x86_64 {
+                304
+            } else {
+                265
+            }
+        }
+        "reboot" => {
+            if x86_64 {
+                169
+            } else {
+                142
+            }
+        }
+        "swapon" => {
+            if x86_64 {
+                167
+            } else {
+                224
+            }
+        }
+        "swapoff" => {
+            if x86_64 {
+                168
+            } else {
+                225
+            }
+        }
+        "syslog" => {
+            if x86_64 {
+                103
+            } else {
+                116
+            }
+        }
+        "acct" => {
+            if x86_64 {
+                163
+            } else {
+                89
+            }
+        }
+        "quotactl" => {
+            if x86_64 {
+                179
+            } else {
+                60
+            }
+        }
+        "setuid" => {
+            if x86_64 {
+                105
+            } else {
+                146
+            }
+        }
+        "setgid" => {
+            if x86_64 {
+                106
+            } else {
+                144
+            }
+        }
+        "setreuid" => {
+            if x86_64 {
+                113
+            } else {
+                145
+            }
+        }
+        "setregid" => {
+            if x86_64 {
+                114
+            } else {
+                143
+            }
+        }
+        "setresuid" => {
+            if x86_64 {
+                117
+            } else {
+                147
+            }
+        }
+        "setresgid" => {
+            if x86_64 {
+                119
+            } else {
+                149
+            }
+        }
+        "setfsuid" => {
+            if x86_64 {
+                122
+            } else {
+                151
+            }
+        }
+        "setfsgid" => {
+            if x86_64 {
+                123
+            } else {
+                152
+            }
+        }
+        "personality" => {
+            if x86_64 {
+                135
+            } else {
+                92
+            }
+        }
         _ => return None,
     })
 }
@@ -284,13 +506,7 @@ pub fn apply(_p: &Profile) -> Result<(), EnforceError> {
     // SAFETY: `fprog` points at `prog`, which outlives the call. The kernel
     // copies the program during the call and retains nothing.
     let rc = unsafe {
-        prctl(
-            PR_SET_SECCOMP,
-            SECCOMP_MODE_FILTER,
-            &fprog as *const SockFprog as c_ulong,
-            0,
-            0,
-        )
+        prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &fprog as *const SockFprog as c_ulong, 0, 0)
     };
     if rc != 0 {
         return Err(EnforceError::Rejected { stage: "PR_SET_SECCOMP", detail: last_os_error() });

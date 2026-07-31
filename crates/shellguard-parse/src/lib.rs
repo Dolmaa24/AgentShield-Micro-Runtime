@@ -27,8 +27,8 @@ mod lex;
 mod parse;
 
 pub use ast::{
-    basename, Assignment, CaseArm, CommandRef, Context, ListItem, ListOp, Node, Opacity, Redirect,
-    RedirOp, RedirTarget, Simple, Span, Taint, Word, WordPart,
+    basename, Assignment, CaseArm, CommandRef, Context, ListItem, ListOp, Node, Opacity, RedirOp,
+    RedirTarget, Redirect, Simple, Span, Taint, Word, WordPart,
 };
 pub use lex::Op;
 pub use parse::{parse, parse_with_limits, Limits, ParseError};
@@ -232,9 +232,10 @@ mod tests {
 
     #[test]
     fn elif_chain() {
-        assert_eq!(programs("if a; then b; elif c; then d; else e; fi"), vec![
-            "a", "b", "c", "d", "e"
-        ]);
+        assert_eq!(
+            programs("if a; then b; elif c; then d; else e; fi"),
+            vec!["a", "b", "c", "d", "e"]
+        );
     }
 
     #[test]

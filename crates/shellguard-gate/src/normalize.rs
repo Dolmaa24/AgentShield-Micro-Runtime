@@ -222,11 +222,8 @@ impl<'a> Collector<'a> {
             let via = u.via();
             match u {
                 Unwrapped::Argv { words, .. } => {
-                    let span = words
-                        .iter()
-                        .map(|w| w.span)
-                        .reduce(|a, b| a.to(b))
-                        .unwrap_or(s.span);
+                    let span =
+                        words.iter().map(|w| w.span).reduce(|a, b| a.to(b)).unwrap_or(s.span);
                     let synthetic = Simple {
                         assignments: Vec::new(),
                         words: words.to_vec(),

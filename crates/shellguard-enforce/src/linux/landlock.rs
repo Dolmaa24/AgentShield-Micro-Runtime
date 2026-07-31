@@ -191,11 +191,7 @@ pub fn apply(p: &Profile) -> Result<Applied, EnforceError> {
     }
 
     let handled_fs = handled_fs_for_abi(abi);
-    let handled_net = if p.allow_listen && p.allow_network {
-        0
-    } else {
-        handled_net_for_abi(abi)
-    };
+    let handled_net = if p.allow_listen && p.allow_network { 0 } else { handled_net_for_abi(abi) };
 
     let attr = RulesetAttr { handled_access_fs: handled_fs, handled_access_net: handled_net };
     // SAFETY: `attr` is a valid, correctly sized struct that outlives the call.
@@ -247,23 +243,18 @@ pub fn apply(p: &Profile) -> Result<Applied, EnforceError> {
     unsafe { close(ruleset_fd) };
     result?;
 
-    Ok(Applied {
-        abi,
-        truncate_enforced: abi >= 3,
-        network_enforced: abi >= 4 && handled_net != 0,
-    })
+    Ok(Applied { abi, truncate_enforced: abi >= 3, network_enforced: abi >= 4 && handled_net != 0 })
 }
 
 fn add_path(ruleset_fd: c_int, path: &Path, rights: u64) -> Result<(), EnforceError> {
     if rights == 0 {
         return Ok(());
     }
-    let c = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
-        EnforceError::Rejected {
+    let c =
+        CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| EnforceError::Rejected {
             stage: "landlock_add_rule",
             detail: format!("path contains a NUL: {path:?}"),
-        }
-    })?;
+        })?;
 
     // O_PATH opens the directory without read permission on it, which is what
     // lets a ruleset name a directory the process is not otherwise allowed to

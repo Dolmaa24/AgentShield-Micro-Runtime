@@ -20,6 +20,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "shellguard-ffi"
+version = "0.1.0"
+dependencies = [
+ "shellguard-gate",
+ "shellguard-policy",
+]
+
+[[package]]
 name = "shellguard-gate"
 version = "0.1.0"
 dependencies = [

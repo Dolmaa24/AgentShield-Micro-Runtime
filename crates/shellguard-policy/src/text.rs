@@ -77,11 +77,7 @@ pub fn parse_policy(src: &str) -> Result<Policy, PolicyError> {
             if preds.is_empty() {
                 return Err(err("empty `any` block".into()));
             }
-            current
-                .as_mut()
-                .expect("checked when the block opened")
-                .preds
-                .push(Pred::Any(preds));
+            current.as_mut().expect("checked when the block opened").preds.push(Pred::Any(preds));
             continue;
         }
 
@@ -131,13 +127,12 @@ pub fn parse_policy(src: &str) -> Result<Policy, PolicyError> {
             match head {
                 "version" => {
                     let v = args.first().ok_or_else(|| err("`version` needs a number".into()))?;
-                    policy.version =
-                        v.parse().map_err(|_| err(format!("bad version `{v}`")))?;
+                    policy.version = v.parse().map_err(|_| err(format!("bad version `{v}`")))?;
                 }
                 "default" => {
                     let v = args.first().ok_or_else(|| err("`default` needs a verdict".into()))?;
-                    policy.default_verdict = Verdict::parse(v)
-                        .ok_or_else(|| err(format!("unknown verdict `{v}`")))?;
+                    policy.default_verdict =
+                        Verdict::parse(v).ok_or_else(|| err(format!("unknown verdict `{v}`")))?;
                 }
                 other => return Err(err(format!("unknown directive `{other}`"))),
             }
@@ -530,7 +525,8 @@ end
 
     #[test]
     fn unterminated_any_is_rejected() {
-        let src = format!("{MINIMAL}\nrule t deny\n  reason t\n  program rm\n  any\n    arg-eq /\nend\n");
+        let src =
+            format!("{MINIMAL}\nrule t deny\n  reason t\n  program rm\n  any\n    arg-eq /\nend\n");
         assert!(parse_err(&src).contains("expected `end-any`"));
     }
 
@@ -544,7 +540,8 @@ end
     fn unknown_verdict_and_capability_are_rejected() {
         let src = format!("{MINIMAL}\nrule t maybe\n  reason t\nend\n");
         assert!(parse_err(&src).contains("unknown verdict"));
-        let src = format!("{MINIMAL}\nrule t deny\n  reason t\n  program rm\n  cap fs.teleport\nend\n");
+        let src =
+            format!("{MINIMAL}\nrule t deny\n  reason t\n  program rm\n  cap fs.teleport\nend\n");
         assert!(parse_err(&src).contains("unknown capability"));
     }
 
@@ -558,8 +555,9 @@ end
     fn flag_directives_reject_stray_arguments() {
         // `write-redirect /etc` is almost certainly a misunderstanding of the
         // directive, so it is an error rather than a silently ignored argument.
-        let src =
-            format!("{MINIMAL}\nrule t deny\n  reason t\n  program rm\n  write-redirect /etc\nend\n");
+        let src = format!(
+            "{MINIMAL}\nrule t deny\n  reason t\n  program rm\n  write-redirect /etc\nend\n"
+        );
         assert!(parse_err(&src).contains("takes no arguments"));
     }
 

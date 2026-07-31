@@ -234,7 +234,12 @@ mod tests {
             version: 1,
             default_verdict: Verdict::Confine,
             rules: vec![
-                rule("shadow", &[], vec![Pred::TextContains(vec!["/etc/shadow".into()])], Verdict::Deny),
+                rule(
+                    "shadow",
+                    &[],
+                    vec![Pred::TextContains(vec!["/etc/shadow".into()])],
+                    Verdict::Deny,
+                ),
                 rule("ssh", &[], vec![Pred::TextContains(vec!["/.ssh/".into()])], Verdict::Ask),
             ],
         }
@@ -242,7 +247,8 @@ mod tests {
         assert_eq!(p.prefilter_pattern_count(), 2);
         assert_eq!(p.unindexed_rule_count(), 0);
 
-        let f = CommandFacts { program: Some("cat"), text: "cat /etc/shadow", ..Default::default() };
+        let f =
+            CommandFacts { program: Some("cat"), text: "cat /etc/shadow", ..Default::default() };
         assert_eq!(eval(&p, &f), vec!["shadow"]);
         let f = CommandFacts { program: Some("cat"), text: "cat README", ..Default::default() };
         assert!(eval(&p, &f).is_empty());

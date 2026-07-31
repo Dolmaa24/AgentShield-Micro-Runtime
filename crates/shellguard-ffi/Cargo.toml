@@ -1,0 +1,19 @@
+[package]
+name = "shellguard-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "C ABI for shellguard, for agent harnesses written in Python, Node or Go"
+
+[lib]
+name = "shellguard"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+shellguard-gate = { path = "../shellguard-gate" }
+shellguard-policy = { path = "../shellguard-policy" }
+
+[lints]
+workspace = true

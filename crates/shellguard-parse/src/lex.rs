@@ -95,8 +95,12 @@ impl Op {
 /// the command, then append", which is a different program.
 pub fn scan_operator(src: &[u8], pos: usize) -> Option<(Op, usize)> {
     let rest = &src[pos..];
-    const THREE: &[(&[u8], Op)] =
-        &[(b"&>>", Op::AndDGreat), (b"<<<", Op::TLess), (b"<<-", Op::DLessDash), (b";;&", Op::DSemiAmp)];
+    const THREE: &[(&[u8], Op)] = &[
+        (b"&>>", Op::AndDGreat),
+        (b"<<<", Op::TLess),
+        (b"<<-", Op::DLessDash),
+        (b";;&", Op::DSemiAmp),
+    ];
     const TWO: &[(&[u8], Op)] = &[
         (b"&&", Op::AndAnd),
         (b"||", Op::OrOr),

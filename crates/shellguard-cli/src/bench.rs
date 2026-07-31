@@ -115,10 +115,7 @@ pub fn adversarial_inputs() -> Vec<(&'static str, String)> {
     // Each `$(` triggers a forward scan for its match.
     v.push(("3k sibling substitutions", format!("echo {}", "$(id) ".repeat(3000))));
 
-    v.push((
-        "2k-stage pipeline",
-        (0..2000).map(|_| "grep x").collect::<Vec<_>>().join(" | "),
-    ));
+    v.push(("2k-stage pipeline", (0..2000).map(|_| "grep x").collect::<Vec<_>>().join(" | ")));
 
     // Quoted delimiters inside substitutions: the scan cannot stop at the
     // first `)` it sees, so it must track quote state the whole way.
@@ -129,10 +126,7 @@ pub fn adversarial_inputs() -> Vec<(&'static str, String)> {
 
     // Deeply nested parameter expansions with defaults, each of which is
     // rescanned for embedded substitutions.
-    v.push((
-        "800 nested parameter defaults",
-        format!("echo {}", "${X:-$(id)} ".repeat(800)),
-    ));
+    v.push(("800 nested parameter defaults", format!("echo {}", "${X:-$(id)} ".repeat(800))));
 
     v.push((
         "500 here-strings",

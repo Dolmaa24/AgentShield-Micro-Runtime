@@ -54,18 +54,29 @@ fn shape_for(program: &str) -> Option<(Shape, &'static str)> {
         "sudo" => (
             Shape {
                 value_flags: &[
-                    "-u", "-g", "-C", "-p", "-r", "-t", "-h", "--user", "--group", "--prompt",
-                    "--close-from", "--role", "--type", "--host",
+                    "-u",
+                    "-g",
+                    "-C",
+                    "-p",
+                    "-r",
+                    "-t",
+                    "-h",
+                    "--user",
+                    "--group",
+                    "--prompt",
+                    "--close-from",
+                    "--role",
+                    "--type",
+                    "--host",
                 ],
                 positionals: 0,
                 assignments: true,
             },
             "sudo",
         ),
-        "doas" => (
-            Shape { value_flags: &["-u", "-C"], positionals: 0, assignments: false },
-            "doas",
-        ),
+        "doas" => {
+            (Shape { value_flags: &["-u", "-C"], positionals: 0, assignments: false }, "doas")
+        }
         "env" => (
             Shape {
                 value_flags: &["-u", "-C", "-S", "--unset", "--chdir", "--split-string"],
@@ -99,16 +110,11 @@ fn shape_for(program: &str) -> Option<(Shape, &'static str)> {
             },
             "timeout",
         ),
-        "taskset" => (
-            Shape { value_flags: &["-p", "-c"], positionals: 1, assignments: false },
-            "taskset",
-        ),
+        "taskset" => {
+            (Shape { value_flags: &["-p", "-c"], positionals: 1, assignments: false }, "taskset")
+        }
         "watch" => (
-            Shape {
-                value_flags: &["-n", "-d", "--interval"],
-                positionals: 0,
-                assignments: false,
-            },
+            Shape { value_flags: &["-n", "-d", "--interval"], positionals: 0, assignments: false },
             "watch",
         ),
         "strace" | "ltrace" | "dtruss" | "ktrace" => (
@@ -122,8 +128,21 @@ fn shape_for(program: &str) -> Option<(Shape, &'static str)> {
         "xargs" | "gxargs" => (
             Shape {
                 value_flags: &[
-                    "-n", "-P", "-I", "-i", "-d", "-s", "-a", "-E", "-L", "--max-args",
-                    "--max-procs", "--replace", "--delimiter", "--max-chars", "--arg-file",
+                    "-n",
+                    "-P",
+                    "-I",
+                    "-i",
+                    "-d",
+                    "-s",
+                    "-a",
+                    "-E",
+                    "-L",
+                    "--max-args",
+                    "--max-procs",
+                    "--replace",
+                    "--delimiter",
+                    "--max-chars",
+                    "--arg-file",
                     "--max-lines",
                 ],
                 positionals: 0,
@@ -188,11 +207,7 @@ fn generic<'a>(s: &'a Simple, shape: &Shape, via: &'static str) -> Vec<Unwrapped
 
         if lit.starts_with('-') && lit.len() > 1 {
             // `-n 10` consumes a following word; `-n10` and `-n=10` do not.
-            let takes_value = shape
-                .value_flags
-                .iter()
-                .any(|f| lit == *f)
-                && !lit.contains('=');
+            let takes_value = shape.value_flags.iter().any(|f| lit == *f) && !lit.contains('=');
             i += 1;
             if takes_value {
                 i += 1;
@@ -318,10 +333,9 @@ mod tests {
         unwrap_wrapper(&s)
             .iter()
             .map(|u| match u {
-                Unwrapped::Argv { words, .. } => words
-                    .first()
-                    .and_then(|w| w.literal())
-                    .unwrap_or_default(),
+                Unwrapped::Argv { words, .. } => {
+                    words.first().and_then(|w| w.literal()).unwrap_or_default()
+                }
                 Unwrapped::ShellText { text, .. } => format!("<shell:{text}>"),
             })
             .collect()
@@ -391,10 +405,7 @@ mod tests {
 
     #[test]
     fn find_with_several_exec_clauses() {
-        assert_eq!(
-            inner(r"find . -exec chmod 777 {} \; -exec rm {} \;"),
-            vec!["chmod", "rm"]
-        );
+        assert_eq!(inner(r"find . -exec chmod 777 {} \; -exec rm {} \;"), vec!["chmod", "rm"]);
     }
 
     #[test]

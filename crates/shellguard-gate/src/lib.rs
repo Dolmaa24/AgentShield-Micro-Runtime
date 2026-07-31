@@ -147,8 +147,7 @@ mod tests {
         // Either it unwrapped far enough to find `rm`, or it reported that it
         // could not. What it must never do is come back clean.
         assert!(
-            d.findings.iter().any(|f| f.program.as_deref() == Some("rm"))
-                || d.incomplete.is_some()
+            d.findings.iter().any(|f| f.program.as_deref() == Some("rm")) || d.incomplete.is_some()
         );
     }
 
@@ -200,10 +199,7 @@ mod tests {
 
     #[test]
     fn tar_checkpoint_actions_are_denied() {
-        assert_eq!(
-            verdict("tar -xf a.tar --checkpoint-action=exec=/bin/sh"),
-            Verdict::Deny
-        );
+        assert_eq!(verdict("tar -xf a.tar --checkpoint-action=exec=/bin/sh"), Verdict::Deny);
     }
 
     #[test]

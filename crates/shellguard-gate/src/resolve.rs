@@ -187,10 +187,8 @@ pub fn lexical_normalize(p: &Path) -> PathBuf {
             Component::ParentDir => {
                 // Popping past the root leaves the root, matching how the
                 // kernel treats `/..`.
-                if !out.pop() {
-                    if out.as_os_str().is_empty() {
-                        out.push("..");
-                    }
+                if !out.pop() && out.as_os_str().is_empty() {
+                    out.push("..");
                 }
             }
             other => out.push(other.as_os_str()),

@@ -303,7 +303,10 @@ impl<'a> Parser<'a> {
                 let write = c == b'>';
                 self.pos += 2;
                 let close = find_matching(self.src, self.pos, b'(', b')').ok_or(
-                    ParseError::Unterminated { what: "process substitution", at: self.span(start, self.pos) },
+                    ParseError::Unterminated {
+                        what: "process substitution",
+                        at: self.span(start, self.pos),
+                    },
                 )?;
                 let inner_start = self.pos;
                 let node = self.sub_parse(inner_start, close)?;
@@ -511,9 +514,8 @@ impl<'a> Parser<'a> {
             }
             Some(b'(') => self.scan_command_sub(parts, lit, d, word_start)?,
             Some(b'{') => {
-                let close = find_matching(self.src, d + 2, b'{', b'}').ok_or(
-                    ParseError::Unterminated { what: "${", at: self.span(word_start, d) },
-                )?;
+                let close = find_matching(self.src, d + 2, b'{', b'}')
+                    .ok_or(ParseError::Unterminated { what: "${", at: self.span(word_start, d) })?;
                 let inner = &self.text[d + 2..close];
                 let (name, op) = split_param_expansion(inner);
                 let nested = self.scan_nested_substitutions(d + 2, close)?;
@@ -587,10 +589,8 @@ impl<'a> Parser<'a> {
         d: usize,
         word_start: usize,
     ) -> Result<(), ParseError> {
-        let close = find_matching(self.src, d + 2, b'(', b')').ok_or(ParseError::Unterminated {
-            what: "$( ",
-            at: self.span(word_start, d),
-        })?;
+        let close = find_matching(self.src, d + 2, b'(', b')')
+            .ok_or(ParseError::Unterminated { what: "$( ", at: self.span(word_start, d) })?;
         let node = self.sub_parse(d + 2, close)?;
         self.pos = close + 1;
         flush(parts, lit);
@@ -825,9 +825,7 @@ impl<'a> Parser<'a> {
                     Some("case") => self.parse_case(),
                     Some("function") => self.parse_function_keyword(),
                     Some("[[") => self.parse_cond(),
-                    Some(name) if self.looks_like_function_def(name) => {
-                        self.parse_function_posix()
-                    }
+                    Some(name) if self.looks_like_function_def(name) => self.parse_function_posix(),
                     _ => self.parse_simple(stop),
                 }
             }
@@ -906,11 +904,7 @@ impl<'a> Parser<'a> {
         self.expect_op(Op::RParen)?;
         let redirects = self.parse_redirect_suffix()?;
         self.bump_node()?;
-        Ok(Node::Subshell {
-            body: Box::new(body),
-            redirects,
-            span: self.span(start, self.pos),
-        })
+        Ok(Node::Subshell { body: Box::new(body), redirects, span: self.span(start, self.pos) })
     }
 
     fn parse_group(&mut self) -> Result<Node, ParseError> {
@@ -1037,8 +1031,10 @@ impl<'a> Parser<'a> {
         self.next_tok()?; // `for`
 
         // `for ((init; cond; step))` is the arithmetic form.
-        if matches!(self.peek_tok()?.0, Tok::Op(Op::LParen)) {
-            if self.src.get(self.peek_end()) == Some(&b'(') {
+        if matches!(self.peek_tok()?.0, Tok::Op(Op::LParen))
+            && self.src.get(self.peek_end()) == Some(&b'(')
+        {
+            {
                 if let Some(_arith) = self.try_parse_arith_command()? {
                     self.skip_separators()?;
                     self.expect_word("do")?;
@@ -1124,7 +1120,10 @@ impl<'a> Parser<'a> {
                 break;
             }
             if matches!(self.peek_tok()?.0, Tok::Eof) {
-                return Err(ParseError::Unterminated { what: "case", at: self.span(start, self.pos) });
+                return Err(ParseError::Unterminated {
+                    what: "case",
+                    at: self.span(start, self.pos),
+                });
             }
 
             // An optional `(` before the first pattern.
@@ -1201,12 +1200,7 @@ impl<'a> Parser<'a> {
         }
 
         self.bump_node()?;
-        Ok(Node::Simple(Simple {
-            assignments,
-            words,
-            redirects,
-            span: self.span(start, self.pos),
-        }))
+        Ok(Node::Simple(Simple { assignments, words, redirects, span: self.span(start, self.pos) }))
     }
 
     /// Redirections that follow a compound command: `{ ...; } > log`.
@@ -1349,13 +1343,8 @@ impl<'a> Parser<'a> {
     // ------------------------------------------------------------- utilities
 
     fn skip_separators(&mut self) -> Result<(), ParseError> {
-        loop {
-            match self.peek_tok()?.0 {
-                Tok::Op(Op::Semi) | Tok::Op(Op::Newline) => {
-                    self.next_tok()?;
-                }
-                _ => break,
-            }
+        while let Tok::Op(Op::Semi) | Tok::Op(Op::Newline) = self.peek_tok()?.0 {
+            self.next_tok()?;
         }
         Ok(())
     }

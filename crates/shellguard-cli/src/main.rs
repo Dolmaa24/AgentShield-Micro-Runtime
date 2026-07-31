@@ -101,8 +101,7 @@ fn parse_opts(args: impl Iterator<Item = String>) -> Result<Opts, String> {
             "-p" | "--policy" => o.policy = Some(PathBuf::from(take("--policy")?)),
             "-d" | "--deadline" => {
                 let v = take("--deadline")?;
-                o.deadline_ms =
-                    Some(v.parse().map_err(|_| format!("bad deadline `{v}`"))?);
+                o.deadline_ms = Some(v.parse().map_err(|_| format!("bad deadline `{v}`"))?);
             }
             "-n" | "--iterations" => {
                 let v = take("--iterations")?;
@@ -243,65 +242,7 @@ fn print_human(src: &str, d: &Decision) {
 }
 
 fn print_json(src: &str, d: &Decision) {
-    let mut s = String::new();
-    s.push_str("{\"command\":");
-    json_str(&mut s, src);
-    s.push_str(",\"verdict\":");
-    json_str(&mut s, d.verdict.as_str());
-    s.push_str(&format!(",\"elapsed_ns\":{}", d.elapsed.as_nanos()));
-    if let Some(i) = &d.incomplete {
-        s.push_str(",\"incomplete\":");
-        json_str(&mut s, &i.to_string());
-    }
-    s.push_str(",\"capabilities\":[");
-    for (i, c) in d.capabilities.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
-        json_str(&mut s, c.as_str());
-    }
-    s.push_str("],\"findings\":[");
-    for (i, f) in d.findings.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
-        s.push_str("{\"rule\":");
-        json_str(&mut s, &f.rule_id);
-        s.push_str(",\"verdict\":");
-        json_str(&mut s, f.verdict.as_str());
-        s.push_str(",\"reason\":");
-        json_str(&mut s, &f.reason);
-        s.push_str(",\"excerpt\":");
-        json_str(&mut s, f.excerpt.trim());
-        if let Some(p) = &f.program {
-            s.push_str(",\"program\":");
-            json_str(&mut s, p);
-        }
-        if let Some(v) = f.via {
-            s.push_str(",\"via\":");
-            json_str(&mut s, v);
-        }
-        s.push_str(&format!(",\"span\":[{},{}]", f.span.start, f.span.end));
-        s.push('}');
-    }
-    s.push_str("]}");
-    println!("{s}");
-}
-
-fn json_str(out: &mut String, s: &str) {
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
+    println!("{}", d.to_json(src));
 }
 
 // ---------------------------------------------------------------- profile
@@ -418,11 +359,7 @@ fn cmd_corpus(o: &Opts) -> Result<ExitCode, String> {
         out.by_verdict[Verdict::Deny as usize],
     );
 
-    Ok(if out.mismatches.is_empty() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    })
+    Ok(if out.mismatches.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
 
 // ------------------------------------------------------------------ bench
@@ -442,11 +379,7 @@ fn cmd_bench(o: &Opts) -> Result<ExitCode, String> {
     let gate = Gate::with_default_policy(cfg);
 
     let iterations = o.iterations.unwrap_or(200);
-    eprintln!(
-        "measuring {} commands x {} iterations ...",
-        commands.len(),
-        iterations
-    );
+    eprintln!("measuring {} commands x {} iterations ...", commands.len(), iterations);
     let r = bench::run(&gate, &commands, iterations);
 
     let budget = Duration::from_millis(10);
@@ -462,8 +395,7 @@ fn cmd_bench(o: &Opts) -> Result<ExitCode, String> {
     );
     let _ = writeln!(out);
     let _ = writeln!(out, "  {:<10} {:>12} {:>12}", "", "full gate", "parse only");
-    for (label, p) in
-        [("p50", 50.0), ("p90", 90.0), ("p99", 99.0), ("p99.9", 99.9), ("max", 100.0)]
+    for (label, p) in [("p50", 50.0), ("p90", 90.0), ("p99", 99.0), ("p99.9", 99.9), ("max", 100.0)]
     {
         let _ = writeln!(
             out,
@@ -498,13 +430,7 @@ fn cmd_bench(o: &Opts) -> Result<ExitCode, String> {
         } else {
             t.command.clone()
         };
-        let _ = writeln!(
-            out,
-            "    {:>9}  {:>9}  {}",
-            bench::fmt(t.p99),
-            bench::fmt(t.max),
-            c
-        );
+        let _ = writeln!(out, "    {:>9}  {:>9}  {}", bench::fmt(t.p99), bench::fmt(t.max), c);
     }
 
     // The steady-state numbers above describe ordinary work. These describe
@@ -512,11 +438,8 @@ fn cmd_bench(o: &Opts) -> Result<ExitCode, String> {
     // budget claim actually rests on.
     let adv = bench::run_adversarial(&gate, 30.max(iterations / 10));
     let _ = writeln!(out, "\n  adversarial inputs, at the parser's resource limits:");
-    let _ = writeln!(
-        out,
-        "    {:>9}  {:>9}  {:>8}  {:>7}  input",
-        "p99", "max", "bytes", "verdict"
-    );
+    let _ =
+        writeln!(out, "    {:>9}  {:>9}  {:>8}  {:>7}  input", "p99", "max", "bytes", "verdict");
     let mut adv_max = Duration::ZERO;
     for a in &adv {
         adv_max = adv_max.max(a.max);

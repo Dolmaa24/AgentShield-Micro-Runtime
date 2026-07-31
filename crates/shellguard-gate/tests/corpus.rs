@@ -40,7 +40,8 @@ fn cases() -> Vec<(usize, Verdict, String)> {
             continue;
         }
         let (v, cmd) = line.split_once(char::is_whitespace).expect("verdict then command");
-        let verdict = Verdict::parse(v).unwrap_or_else(|| panic!("line {}: bad verdict {v}", i + 1));
+        let verdict =
+            Verdict::parse(v).unwrap_or_else(|| panic!("line {}: bad verdict {v}", i + 1));
         out.push((i + 1, verdict, cmd.trim().to_string()));
     }
     out
@@ -97,10 +98,7 @@ fn adversarial() -> Vec<(&'static str, String)> {
         ),
         ("3k sibling substitutions", format!("echo {}", "$(id) ".repeat(3000))),
         ("2k-stage pipeline", (0..2000).map(|_| "grep x").collect::<Vec<_>>().join(" | ")),
-        (
-            "1k quote-confusing substitutions",
-            format!("echo {}", r#""$(a ")" b)" "#.repeat(1000)),
-        ),
+        ("1k quote-confusing substitutions", format!("echo {}", r#""$(a ")" b)" "#.repeat(1000))),
         ("800 nested parameter defaults", format!("echo {}", "${X:-$(id)} ".repeat(800))),
         ("over the byte cap", format!("echo {}", "a".repeat(200_000))),
     ]
@@ -149,10 +147,6 @@ fn a_blown_deadline_never_allows() {
 
     for (_, _, command) in cases().into_iter().take(40) {
         let d = gate.evaluate(&command, &mut worker);
-        assert_ne!(
-            d.verdict,
-            Verdict::Allow,
-            "an impossible deadline allowed {command:?}"
-        );
+        assert_ne!(d.verdict, Verdict::Allow, "an impossible deadline allowed {command:?}");
     }
 }

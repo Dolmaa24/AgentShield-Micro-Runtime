@@ -216,7 +216,7 @@ impl Gate {
         // Most severe first, so the first line of a report is the reason.
         // A stable sort keeps declaration order within a severity, which is
         // what makes two runs of the same command produce identical output.
-        findings.sort_by(|a, b| b.verdict.cmp(&a.verdict));
+        findings.sort_by_key(|f| std::cmp::Reverse(f.verdict));
 
         cmds.clear();
         w.cmds = cmds;

@@ -296,10 +296,9 @@ impl Pred {
             Pred::WriteRedirect => f.has_write_redirect,
             Pred::TruncatingRedirect => f.has_truncating_redirect,
             Pred::WriteRedirectOutside => f.write_redirect_outside_workspace,
-            Pred::WriteTargetPrefix(vs) => f
-                .write_targets
-                .iter()
-                .any(|t| vs.iter().any(|v| t.prefix.starts_with(v.as_str()))),
+            Pred::WriteTargetPrefix(vs) => {
+                f.write_targets.iter().any(|t| vs.iter().any(|v| t.prefix.starts_with(v.as_str())))
+            }
             Pred::Assigns(vs) => f.assignments.iter().any(|a| vs.iter().any(|v| v == a)),
             Pred::PathOutsideWorkspace => f.args.iter().any(|a| a.outside_workspace),
             Pred::UnresolvedPath => f.args.iter().any(|a| a.unresolved_path),
@@ -464,10 +463,7 @@ mod tests {
         let f = facts("rm", &args, "rf");
         let p = Pred::Not(Box::new(Pred::ArgEq(vec!["/".into()])));
         assert!(p.matches(&f));
-        let p = Pred::Any(vec![
-            Pred::ArgEq(vec!["/".into()]),
-            Pred::ArgEq(vec!["build".into()]),
-        ]);
+        let p = Pred::Any(vec![Pred::ArgEq(vec!["/".into()]), Pred::ArgEq(vec!["build".into()])]);
         assert!(p.matches(&f));
     }
 
@@ -502,11 +498,8 @@ mod tests {
     #[test]
     fn disjunction_indexes_only_when_every_branch_does() {
         let mut out = Vec::new();
-        Pred::Any(vec![
-            Pred::ArgEq(vec!["a".into()]),
-            Pred::ArgEq(vec!["b".into()]),
-        ])
-        .needles(&mut out);
+        Pred::Any(vec![Pred::ArgEq(vec!["a".into()]), Pred::ArgEq(vec!["b".into()])])
+            .needles(&mut out);
         assert_eq!(out, vec!["a".to_string(), "b".to_string()]);
 
         // One branch has no needle, so the whole disjunction is unindexable.
