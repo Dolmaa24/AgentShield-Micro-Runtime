@@ -166,6 +166,7 @@ impl Gate {
                 arg_taint: cmd.arg_taint,
                 opacity: cmd.opacity,
                 has_write_redirect: cmd.has_write_redirect,
+                has_truncating_redirect: cmd.has_truncating_redirect,
                 write_redirect_outside_workspace: cmd.write_redirect_outside,
                 downstream: &downstream,
                 upstream: &upstream,

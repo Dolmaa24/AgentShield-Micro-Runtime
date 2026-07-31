@@ -193,6 +193,17 @@ end
 rule destructive.truncate-outside deny
   reason a shell redirection truncates a file outside the workspace
   write-redirect-outside
+  truncating-redirect
+  cap fs.write
+end
+
+# Appending is not truncating. `>> ~/.zshrc` adds a line and destroys nothing,
+# so it escalates rather than refuses — and refusing it under a reason that
+# says "truncates" would be telling the reader something untrue.
+rule fs.append-outside ask
+  reason a shell redirection appends to a file outside the workspace
+  write-redirect-outside
+  not truncating-redirect
   cap fs.write
 end
 
@@ -224,9 +235,13 @@ rule device.raw-write deny
   cap device.write
 end
 
+# The `mkfs.*` variants are listed out because program matching is on the exact
+# basename: `mkfs.ext4` does not match a rule naming `mkfs`, and a rule that
+# looks like it covers disk formatting while missing every real invocation of
+# it is worse than no rule.
 rule device.format deny
   reason formats, partitions or erases a disk
-  program mkfs fdisk parted diskutil newfs_hfs newfs_apfs sgdisk wipefs shred
+  program mkfs mkfs.ext2 mkfs.ext3 mkfs.ext4 mkfs.xfs mkfs.btrfs mkfs.vfat mkfs.fat mkfs.ntfs mkfs.exfat mke2fs fdisk sfdisk parted diskutil newfs_hfs newfs_apfs sgdisk wipefs shred
   cap device.write
 end
 
@@ -323,8 +338,13 @@ rule vcs.checkout-discard ask
   cap fs.write
 end
 
-rule vcs.force-push deny
-  reason force-push rewrites history that other people have already pulled
+# `ask`, not `deny`. Force-pushing a feature branch is routine; force-pushing
+# `main` is not, and the rule cannot tell them apart without knowing which
+# branches are protected. Denying both would block ordinary work, and the
+# principle at the top of this file is that a gate which blocks ordinary work
+# is a gate that gets switched off.
+rule vcs.force-push ask
+  reason force-push rewrites history that other people may have already pulled
   program git
   subcommand push
   any
@@ -454,9 +474,13 @@ end
 # a reputation for being slow.
 # ---------------------------------------------------------------------------
 
+# `sed` and `awk` are deliberately absent. Both are usually read-only and both
+# can write: `sed -i` rewrites in place, and `awk '{print > "/etc/x"}'` writes
+# a file the argv never names as a path. Neither can be blanket-allowed on the
+# strength of how they are usually used, so they fall to the `confine` default.
 rule safe.inspection allow
   reason read-only inspection confined to the workspace
-  program ls pwd echo cat head tail wc grep egrep fgrep rg find file stat basename dirname date true false printf sort uniq cut sed awk diff which type id uname hostname
+  program ls pwd echo cat head tail wc grep egrep fgrep rg find file stat basename dirname date true false printf sort uniq cut diff which type id uname hostname
   not path-outside-workspace
   not write-redirect
   not unresolved-path

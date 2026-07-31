@@ -300,6 +300,7 @@ fn predicate(head: &str, args: &[String]) -> Result<Pred, String> {
             })
         }
         "write-redirect" => none(Pred::WriteRedirect)?,
+        "truncating-redirect" => none(Pred::TruncatingRedirect)?,
         "write-redirect-outside" => none(Pred::WriteRedirectOutside)?,
         "write-target-prefix" => {
             need("at least one prefix")?;

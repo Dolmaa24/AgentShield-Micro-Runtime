@@ -1,0 +1,21 @@
+[package]
+name = "shellguard-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line front end for shellguard"
+
+[[bin]]
+name = "shellguard"
+path = "src/main.rs"
+
+[dependencies]
+shellguard-parse = { path = "../shellguard-parse" }
+shellguard-policy = { path = "../shellguard-policy" }
+shellguard-gate = { path = "../shellguard-gate" }
+shellguard-enforce = { path = "../shellguard-enforce" }
+
+[lints]
+workspace = true

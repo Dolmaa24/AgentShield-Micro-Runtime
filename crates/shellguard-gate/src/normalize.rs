@@ -43,6 +43,7 @@ pub struct Cmd {
     pub arg_taint: Taint,
     pub opacity: Opacity,
     pub has_write_redirect: bool,
+    pub has_truncating_redirect: bool,
     pub write_redirect_outside: bool,
     pub upstream: Vec<String>,
     pub downstream: Vec<String>,
@@ -328,6 +329,7 @@ impl<'a> Collector<'a> {
                 continue;
             }
             cmd.has_write_redirect = true;
+            cmd.has_truncating_redirect |= r.op.truncates();
             if let RedirTarget::Word(w) = &r.target {
                 let t = self.word_to_arg(w);
                 if t.outside_workspace {

@@ -182,6 +182,12 @@ pub struct CommandFacts<'a> {
     pub arg_taint: Taint,
     pub opacity: Opacity,
     pub has_write_redirect: bool,
+    /// At least one redirection *truncates* rather than appends.
+    ///
+    /// Worth distinguishing: `> file` destroys what was there and `>> file`
+    /// does not, and a rule that denies both under a reason that says
+    /// "truncates" is lying to whoever reads the refusal.
+    pub has_truncating_redirect: bool,
     pub write_redirect_outside_workspace: bool,
     /// Programs this command's output feeds.
     pub downstream: &'a [&'a str],
@@ -229,6 +235,8 @@ pub enum Pred {
     OpacityAtLeast(Opacity),
     /// The command has a redirection that creates or truncates a file.
     WriteRedirect,
+    /// At least one redirection truncates an existing file.
+    TruncatingRedirect,
     /// A write redirection targets somewhere outside the workspace.
     WriteRedirectOutside,
     /// Some write-redirection target begins with one of these.
@@ -286,6 +294,7 @@ impl Pred {
             Pred::TaintAtLeast(t) => f.arg_taint >= *t,
             Pred::OpacityAtLeast(o) => f.opacity >= *o,
             Pred::WriteRedirect => f.has_write_redirect,
+            Pred::TruncatingRedirect => f.has_truncating_redirect,
             Pred::WriteRedirectOutside => f.write_redirect_outside_workspace,
             Pred::WriteTargetPrefix(vs) => f
                 .write_targets
