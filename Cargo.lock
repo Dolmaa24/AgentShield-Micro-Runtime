@@ -45,3 +45,11 @@ version = "0.1.0"
 dependencies = [
  "shellguard-parse",
 ]
+
+[[package]]
+name = "shellguard-runtime"
+version = "0.1.0"
+dependencies = [
+ "shellguard-enforce",
+ "shellguard-policy",
+]

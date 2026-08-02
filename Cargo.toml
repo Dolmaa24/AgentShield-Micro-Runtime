@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/shellguard-parse", "crates/shellguard-policy", "crates/shellguard-gate", "crates/shellguard-enforce", "crates/shellguard-cli", "crates/shellguard-ffi"]
+members = ["crates/shellguard-parse", "crates/shellguard-policy", "crates/shellguard-gate", "crates/shellguard-enforce", "crates/shellguard-cli", "crates/shellguard-ffi", "crates/shellguard-runtime"]
 
 # Every crate here has zero external dependencies. That is a deliberate
 # constraint, not an accident of scope: this library is a security boundary

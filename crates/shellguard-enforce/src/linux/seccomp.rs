@@ -492,6 +492,36 @@ pub fn set_no_new_privs() -> Result<(), EnforceError> {
     Ok(())
 }
 
+/// `PR_SET_NO_NEW_PRIVS` with a raw errno, for use after `fork`.
+///
+/// # Safety
+/// Safe to call anywhere, including post-fork: one syscall, no allocation.
+pub unsafe fn set_no_new_privs_raw() -> Result<(), i32> {
+    // SAFETY: constant option with scalar arguments only.
+    if unsafe { prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(errno());
+    }
+    Ok(())
+}
+
+/// Install a prebuilt filter, with a raw errno, for use after `fork`.
+///
+/// # Safety
+/// `prog` must outlive the call. Safe post-fork: one syscall, no allocation —
+/// the program was assembled in the parent.
+pub unsafe fn install_filter_raw(prog: &[SockFilter]) -> Result<(), i32> {
+    let fprog = SockFprog { len: prog.len() as u16, filter: prog.as_ptr() };
+    // SAFETY: `fprog` points at `prog`, which the caller keeps alive. The
+    // kernel copies the program during the call and retains nothing.
+    let rc = unsafe {
+        prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &fprog as *const SockFprog as c_ulong, 0, 0)
+    };
+    if rc != 0 {
+        return Err(errno());
+    }
+    Ok(())
+}
+
 /// Install the filter on the current thread. Irreversible.
 pub fn apply(_p: &Profile) -> Result<(), EnforceError> {
     let arch = native_arch();
@@ -502,20 +532,19 @@ pub fn apply(_p: &Profile) -> Result<(), EnforceError> {
 
     set_no_new_privs()?;
 
-    let fprog = SockFprog { len: prog.len() as u16, filter: prog.as_ptr() };
-    // SAFETY: `fprog` points at `prog`, which outlives the call. The kernel
-    // copies the program during the call and retains nothing.
-    let rc = unsafe {
-        prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &fprog as *const SockFprog as c_ulong, 0, 0)
-    };
-    if rc != 0 {
-        return Err(EnforceError::Rejected { stage: "PR_SET_SECCOMP", detail: last_os_error() });
-    }
-    Ok(())
+    // SAFETY: `prog` is alive for the duration of the call.
+    unsafe { install_filter_raw(&prog) }.map_err(|e| EnforceError::Rejected {
+        stage: "PR_SET_SECCOMP",
+        detail: std::io::Error::from_raw_os_error(e).to_string(),
+    })
 }
 
 fn last_os_error() -> String {
     std::io::Error::last_os_error().to_string()
+}
+
+fn errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
 }
 
 #[cfg(test)]

@@ -143,6 +143,14 @@ pub fn profile_sbpl(p: &Profile) -> Result<String, EnforceError> {
     for d in &p.read_paths {
         s.push_str(&format!("  (subpath {})\n", path_string(d)?));
     }
+    // Everything writable is also readable. A directory a command can write
+    // but not read back is nearly useless — `echo x > f; cat f` fails on the
+    // read — and Landlock's write rights are already a superset of its read
+    // rights, so granting them separately here would make the two platforms
+    // disagree about what the same profile means.
+    for d in p.writable() {
+        s.push_str(&format!("  (subpath {})\n", path_string(d)?));
+    }
     s.push_str(")\n");
 
     // /dev/null and friends have to be writable or almost every pipeline
@@ -265,6 +273,26 @@ mod tests {
         let sbpl = profile_sbpl(&p).unwrap();
         let write_block = sbpl.split("(allow file-write*").nth(1).unwrap();
         assert!(write_block.contains(&ws().display().to_string()));
+    }
+
+    #[test]
+    fn a_writable_path_is_also_readable() {
+        // Found by a runtime test: the private scratch directory was writable
+        // but not readable, so `echo x > $TMPDIR/f; cat $TMPDIR/f` failed on
+        // the read.
+        let p = Profile::from_capabilities(ws(), &[Capability::FsWrite])
+            .with_private_tmp(ws().join("scratch"));
+        std::fs::create_dir_all(ws().join("scratch")).unwrap();
+        let sbpl = profile_sbpl(&p).unwrap();
+        let read_block = sbpl.split("(allow file-read*").nth(1).unwrap();
+        let read_block = read_block.split(")\n(").next().unwrap();
+        for w in p.canonicalized().writable() {
+            assert!(
+                read_block.contains(&w.display().to_string()),
+                "{} is writable but not readable",
+                w.display()
+            );
+        }
     }
 
     #[test]

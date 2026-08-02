@@ -179,6 +179,89 @@ pub struct Applied {
     pub network_enforced: bool,
 }
 
+/// Create and populate a ruleset without applying it, returning the fd and the
+/// negotiated ABI.
+///
+/// Building a ruleset restricts nobody — only `landlock_restrict_self` does.
+/// That split is what lets all the allocating work (canonicalising paths,
+/// opening directory descriptors) happen in the parent, leaving the child with
+/// one syscall. See [`super::Prepared`].
+pub fn build_ruleset(p: &Profile) -> Result<(c_int, u32), EnforceError> {
+    let p = p.canonicalized();
+    let abi = abi_version()?;
+    if abi == 0 {
+        return Err(EnforceError::Unavailable {
+            feature: "landlock",
+            detail: "kernel reports ABI 0".into(),
+        });
+    }
+
+    let handled_fs = handled_fs_for_abi(abi);
+    let handled_net = if p.allow_listen && p.allow_network { 0 } else { handled_net_for_abi(abi) };
+
+    let attr = RulesetAttr { handled_access_fs: handled_fs, handled_access_net: handled_net };
+    // SAFETY: `attr` is a valid, correctly sized struct that outlives the call.
+    let ruleset_fd = unsafe {
+        syscall(
+            SYS_LANDLOCK_CREATE_RULESET,
+            &attr as *const RulesetAttr,
+            std::mem::size_of::<RulesetAttr>(),
+            0u32,
+        )
+    };
+    if ruleset_fd < 0 {
+        return Err(EnforceError::Rejected {
+            stage: "landlock_create_ruleset",
+            detail: std::io::Error::last_os_error().to_string(),
+        });
+    }
+    let ruleset_fd = ruleset_fd as c_int;
+
+    let populate = (|| -> Result<(), EnforceError> {
+        for dir in BASE_READ {
+            // Missing base directories are not an error: a container image may
+            // legitimately have no /lib64.
+            let _ = add_path(ruleset_fd, Path::new(dir), READ_RIGHTS & handled_fs);
+        }
+        add_path(ruleset_fd, &p.workspace, READ_RIGHTS & handled_fs)?;
+        for dir in &p.read_paths {
+            add_path(ruleset_fd, dir, READ_RIGHTS & handled_fs)?;
+        }
+        for dir in p.writable() {
+            add_path(ruleset_fd, dir, WRITE_RIGHTS & handled_fs)?;
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = populate {
+        // SAFETY: live fd, closed exactly once on this path.
+        unsafe { close_fd(ruleset_fd) };
+        return Err(e);
+    }
+    Ok((ruleset_fd, abi))
+}
+
+/// `landlock_restrict_self` with a raw errno, for use after `fork`.
+///
+/// # Safety
+/// `fd` must be a live ruleset descriptor. Safe post-fork: one syscall, no
+/// allocation.
+pub unsafe fn restrict_self_raw(fd: c_int) -> Result<(), i32> {
+    // SAFETY: caller guarantees the fd is a live ruleset.
+    let rc = unsafe { syscall(SYS_LANDLOCK_RESTRICT_SELF, fd, 0u32) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(-1));
+    }
+    Ok(())
+}
+
+/// # Safety
+/// `fd` must be live and not already closed.
+pub unsafe fn close_fd(fd: c_int) {
+    // SAFETY: caller guarantees the fd is live and closed exactly once.
+    unsafe { close(fd) };
+}
+
 /// Apply the profile's filesystem and network scope to the current process.
 pub fn apply(p: &Profile) -> Result<Applied, EnforceError> {
     let p = p.canonicalized();

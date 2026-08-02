@@ -21,7 +21,14 @@ pub struct Profile {
     pub read_paths: Vec<PathBuf>,
     /// Extra writable subtrees.
     pub write_paths: Vec<PathBuf>,
-    /// A private temporary directory, writable if set.
+    /// A *private* scratch directory, writable if set.
+    ///
+    /// Never the shared system temp directory. `/tmp` holds other processes'
+    /// files and is a classic pivot: a command that can write a predictable
+    /// path there can feed input to something outside the sandbox that reads
+    /// it. A capability grant widens the profile to the workspace only; the
+    /// runtime supplies a per-execution directory here, via
+    /// [`Profile::with_private_tmp`].
     pub tmp: Option<PathBuf>,
 
     pub allow_network: bool,
@@ -66,7 +73,6 @@ impl Profile {
             match c {
                 Capability::FsWrite | Capability::FsDelete => {
                     p.write_paths.push(p.workspace.clone());
-                    p.tmp.get_or_insert_with(std::env::temp_dir);
                 }
                 Capability::NetConnect => p.allow_network = true,
                 Capability::NetListen => {
@@ -82,7 +88,6 @@ impl Profile {
                 Capability::PackageInstall => {
                     p.allow_network = true;
                     p.write_paths.push(p.workspace.clone());
-                    p.tmp.get_or_insert_with(std::env::temp_dir);
                 }
                 Capability::VcsHistoryRewrite => {
                     p.write_paths.push(p.workspace.clone());
@@ -104,6 +109,12 @@ impl Profile {
         p.write_paths.sort();
         p.write_paths.dedup();
         p
+    }
+
+    /// Attach a private scratch directory, which the caller owns and removes.
+    pub fn with_private_tmp(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.tmp = Some(dir.into());
+        self
     }
 
     /// Every path the command may write, including the workspace.
@@ -206,6 +217,25 @@ mod tests {
             assert!(p.writable().is_empty(), "{c:?} granted writes");
             assert_eq!(p.allow_network, locked.allow_network, "{c:?} granted network");
         }
+    }
+
+    #[test]
+    fn no_capability_grants_the_shared_temp_directory() {
+        // Found by a runtime test: granting fs.write used to hand over the
+        // system temp directory, so a write to /tmp was permitted. /tmp is
+        // shared with every other process on the machine.
+        let shared = std::env::temp_dir();
+        for c in [Capability::FsWrite, Capability::FsDelete, Capability::PackageInstall] {
+            let p = Profile::from_capabilities("/ws", &[c]);
+            assert!(
+                !p.writable().iter().any(|w| *w == shared.as_path()),
+                "{c:?} granted the shared temp directory"
+            );
+        }
+        // A private one, supplied by the runtime, is granted.
+        let p = Profile::from_capabilities("/ws", &[Capability::FsWrite])
+            .with_private_tmp("/ws/.scratch-1234");
+        assert!(p.writable().iter().any(|w| w.ends_with(".scratch-1234")));
     }
 
     #[test]

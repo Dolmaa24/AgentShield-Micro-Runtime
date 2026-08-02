@@ -1,0 +1,15 @@
+[package]
+name = "shellguard-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Checkpoint and rollback, and the isolated execution runtimes commands run in"
+
+[dependencies]
+shellguard-enforce = { path = "../shellguard-enforce" }
+shellguard-policy = { path = "../shellguard-policy" }
+
+[lints]
+workspace = true
