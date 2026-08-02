@@ -204,7 +204,7 @@ let d = gate.evaluate("rm -rf /etc", &mut worker);
 println!("{}", d.summary());
 ```
 
-C, for a Python or Node harness — see [`include/shellguard.h`](include/shellguard.h)
+C, for a Python or Node harness — see [`include/agent_sandbox.h`](include/agent_sandbox.h)
 and [`examples/smoke.c`](examples/smoke.c):
 
 ```c

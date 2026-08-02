@@ -1,6 +1,8 @@
-/* shellguard — judge an agent's shell command before it runs.
+/* AgentShield micro-runtime — judge an agent's shell command before it runs.
  *
  * Link against libshellguard.dylib / libshellguard.so, or the static library.
+ * The header is named for the project; the library and its `sg_` symbols are
+ * named for the component inside it. The two refer to the same thing.
  *
  * Threading
  * ---------
@@ -22,8 +24,8 @@
  * arguments themselves were unusable.
  */
 
-#ifndef SHELLGUARD_H
-#define SHELLGUARD_H
+#ifndef AGENT_SANDBOX_H
+#define AGENT_SANDBOX_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -152,4 +154,4 @@ void sg_string_free(char *s);
 }
 #endif
 
-#endif /* SHELLGUARD_H */
+#endif /* AGENT_SANDBOX_H */

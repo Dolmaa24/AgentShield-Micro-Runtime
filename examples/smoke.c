@@ -12,7 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "shellguard.h"
+#include "agent_sandbox.h"
 
 static const char *verdict_name(int32_t v) {
     switch (v) {

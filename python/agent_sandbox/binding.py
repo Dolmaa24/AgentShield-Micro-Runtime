@@ -5,8 +5,10 @@ CFFI's compile step would buy nothing and cost a build dependency in a project
 whose whole premise is not having any — see DESIGN.md § 10. ``ctypes`` ships with
 CPython and works from a wheel with no toolchain present.
 
-The header is ``include/shellguard.h``. ``shellguard`` is the library inside the
-AgentShield project; the two names refer to the same thing.
+The header is ``include/agent_sandbox.h``; the library it declares is
+``libshellguard`` with ``sg_``-prefixed symbols. The header is named for the
+project and the library for the component inside it — the two refer to the
+same thing.
 
     from agent_sandbox import SandboxEngine
 

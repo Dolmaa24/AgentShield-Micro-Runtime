@@ -19,7 +19,7 @@
 //! about it, and the answer they reach for under deadline pressure is to run
 //! the command.
 //!
-//! See `include/shellguard.h` for the C declarations.
+//! See `include/agent_sandbox.h` for the C declarations.
 
 // The opaque handle types are named for C, not for Rust. `sg_gate` is what
 // appears in the header and in every caller's source, and renaming it here to
