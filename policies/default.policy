@@ -488,7 +488,7 @@ end
 # strength of how they are usually used, so they fall to the `confine` default.
 rule safe.inspection allow
   reason read-only inspection confined to the workspace
-  program ls pwd echo cat head tail wc grep egrep fgrep rg find file stat basename dirname date true false printf sort uniq cut diff which type id uname hostname
+  program ls pwd echo cat head tail wc grep egrep fgrep rg file stat basename dirname date true false printf sort uniq cut diff which type id uname hostname
   not path-outside-workspace
   not write-redirect
   not unresolved-path
@@ -501,4 +501,42 @@ rule safe.vcs-inspection allow
   subcommand status log diff show branch remote describe rev-parse blame shortlog tag
   not write-redirect
   cap fs.read
+end
+
+
+rule network.exfiltration-tools deny
+  reason network utility capable of data exfiltration
+  program curl wget nc netcat socat ncat
+  cap net.connect
+end
+
+rule credentials.sensitive-files deny
+  reason accessing sensitive credential or key files
+  arg-prefix .env .env. .aws/ id_rsa id_ed25519 .pem .key
+  cap cred.access
+end
+
+
+rule network.exfiltration-tools deny
+  reason network utility capable of data exfiltration
+  program curl wget nc netcat socat ncat
+  cap net.connect
+end
+
+rule credentials.sensitive-files deny
+  reason accessing sensitive credential or key files
+  arg-prefix .env .env. .aws/ id_rsa id_ed25519 .pem .key
+  cap cred.access
+end
+
+rule obfuscation.base64-decode deny
+  reason obfuscated command payload decoding via base64
+  program base64
+  cap shell.escape
+end
+
+rule credentials.env-dump deny
+  reason dumping process environment variables
+  program printenv
+  cap cred.access
 end
