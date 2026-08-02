@@ -8,3 +8,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
+
+# Built by the C example in examples/smoke.c
+/smoke
