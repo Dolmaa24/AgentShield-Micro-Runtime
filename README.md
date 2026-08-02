@@ -27,18 +27,21 @@ identity, so the gate unwraps `find -exec` and judges what actually runs.
 long-running harness that reuses a worker, the same evaluation is ~14 µs —
 see [Latency](#latency).)
 
-**Two layers.** A userspace gate reads the command and decides in microseconds,
-producing a reason a human can act on. A kernel sandbox — Seatbelt on macOS,
-Landlock plus seccomp-BPF on Linux — contains whatever it lets through.
+**Three layers.** A userspace gate reads the command and decides in
+microseconds, producing a reason a human can act on. A kernel sandbox —
+Seatbelt on macOS, Landlock plus seccomp-BPF on Linux — contains whatever it
+lets through. A checkpoint taken beforehand puts the workspace back if the
+command fails its health checks or touches a protected file.
 
 The gate is not a security boundary and this library does not pretend
 otherwise: static analysis of shell is undecidable, and `eval "$(curl x)"` is a
 one-line proof. `Allow` means *no rule objected*. The kernel layer is the
 boundary. See [DESIGN.md § 3](DESIGN.md#3-two-layers-and-why-one-is-not-enough).
 
-**Not production ready.** Linux enforcement compiles but has never run against
-a Linux kernel; rollback is designed but not built. Full list in
-[DESIGN.md § 11](DESIGN.md#11-known-limitations).
+**Not production ready.** Only the local runtime has ever executed anything —
+the Firecracker, gVisor and Virtualization.framework backends are configuration
+and availability detection only, for want of a Linux host and a guest kernel.
+Full list in [DESIGN.md § 12](DESIGN.md#12-known-limitations).
 
 ---
 
@@ -52,6 +55,12 @@ Judge a command:
 
 ```bash
 ./target/release/shellguard eval --workspace ~/project 'rm -rf ./build'
+```
+
+Judge it, run it confined, and revert the workspace if it fails:
+
+```bash
+./target/release/shellguard run -w ~/project --rollback-on-failure 'pytest -q'
 ```
 
 Check the ruleset against its specification:
@@ -138,6 +147,48 @@ They combine by **severity, not declaration order**, so no broad allow can
 outrank a narrow deny. The default for an unmatched command is `Confine`, not
 `Allow` — "no rule matched" means the ruleset had nothing to say, which for
 agent-authored input is the common case rather than evidence of safety.
+
+## Checkpoint and rollback
+
+A checkpoint is taken before the command runs and restored if it fails a health
+check, changes a protected file, or — with `--rollback-on-failure` — exits
+non-zero.
+
+```
+$ shellguard run -w /tmp/work --rollback-on-failure 'rm notes.md; exit 1'
+workspace reverted: the command exited 1
+  confine in 16.03 ms (local runtime, exit 1)
+
+$ cat /tmp/work/notes.md
+unsaved notes
+```
+
+`notes.md` was **untracked**. `git stash create` does not capture untracked
+files, so a naive implementation would have lost it permanently — nothing in git
+ever recorded its contents. They are hashed into the object database separately
+for exactly this case. See [DESIGN.md § 7](DESIGN.md#7-rollback-checkpoint-and-restore).
+
+## Python
+
+```python
+from agent_sandbox import SandboxEngine
+
+with SandboxEngine(workspace="/srv/agent/work", rollback_on_failure=True) as engine:
+    if engine.decide(cmd).denied:
+        return "refused: " + engine.decide(cmd).reason
+
+    result = engine.execute_with_rollback(cmd, "/srv/agent/work")
+    if result.rolled_back:
+        print("reverted:", result.rollback_reasons)
+```
+
+`ctypes`, no build step. A refused command returns normally with `ran=False`
+rather than raising — refusing is the library working, and a binding that raised
+on it would push callers towards `except: pass`.
+
+```bash
+make venv && make test-python
+```
 
 ## Using it as a library
 

@@ -278,7 +278,7 @@ impl Runtime for GvisorRuntime {
         }
         let _ = payload;
         Err(RuntimeError::Unavailable(
-            "the gVisor launch path is unverified; see DESIGN.md § 13".into(),
+            "the gVisor launch path is unverified; see DESIGN.md § 12".into(),
         ))
     }
 }

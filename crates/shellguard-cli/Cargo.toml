@@ -16,6 +16,7 @@ shellguard-parse = { path = "../shellguard-parse" }
 shellguard-policy = { path = "../shellguard-policy" }
 shellguard-gate = { path = "../shellguard-gate" }
 shellguard-enforce = { path = "../shellguard-enforce" }
+shellguard-runtime = { path = "../shellguard-runtime" }
 
 [lints]
 workspace = true

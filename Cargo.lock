@@ -10,6 +10,7 @@ dependencies = [
  "shellguard-gate",
  "shellguard-parse",
  "shellguard-policy",
+ "shellguard-runtime",
 ]
 
 [[package]]

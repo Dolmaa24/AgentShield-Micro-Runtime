@@ -2,7 +2,7 @@
 
 ``ctypes`` rather than CFFI. The C surface is nine functions and no structs, so
 CFFI's compile step would buy nothing and cost a build dependency in a project
-whose whole premise is not having any — see DESIGN.md § 9. ``ctypes`` ships with
+whose whole premise is not having any — see DESIGN.md § 10. ``ctypes`` ships with
 CPython and works from a wheel with no toolchain present.
 
 The header is ``include/shellguard.h``. ``shellguard`` is the library inside the

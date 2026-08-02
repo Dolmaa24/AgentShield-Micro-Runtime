@@ -17,6 +17,7 @@ shellguard — decide whether an agent's shell command should run
 
 USAGE:
     shellguard eval    [OPTIONS] <command>     judge one command
+    shellguard run     [OPTIONS] <command>     judge it, run it, roll back on failure
     shellguard profile [OPTIONS] <command>     show the sandbox profile it would get
     shellguard corpus  [OPTIONS] [FILE]        check the ruleset against expectations
     shellguard bench   [OPTIONS] [FILE]        measure evaluation latency
@@ -28,7 +29,10 @@ OPTIONS:
     -p, --policy FILE      a policy file (default: the built-in ruleset)
     -d, --deadline MS      evaluation budget in milliseconds (default: 10)
     -n, --iterations N     bench iterations over the corpus (default: 200)
-        --json             machine-readable output (eval only)
+        --json             machine-readable output (eval and run)
+        --protect PATH     a file that must not change (repeatable; run only)
+        --rollback-on-failure  revert if the command exits non-zero (run only)
+        --run-on-ask       run commands the gate escalates (run only)
     -h, --help             this text
     -V, --version          version and backend
 
@@ -55,6 +59,9 @@ struct Opts {
     deadline_ms: Option<u64>,
     iterations: Option<usize>,
     json: bool,
+    protect: Vec<PathBuf>,
+    rollback_on_failure: bool,
+    run_on_ask: bool,
     rest: Vec<String>,
 }
 
@@ -83,6 +90,7 @@ fn run() -> Result<ExitCode, String> {
 
     match command.as_str() {
         "eval" => cmd_eval(&opts),
+        "run" => cmd_run(&opts),
         "profile" => cmd_profile(&opts),
         "corpus" => cmd_corpus(&opts),
         "bench" => cmd_bench(&opts),
@@ -111,6 +119,9 @@ fn parse_opts(args: impl Iterator<Item = String>) -> Result<Opts, String> {
                 o.iterations = Some(v.parse().map_err(|_| format!("bad count `{v}`"))?);
             }
             "--json" => o.json = true,
+            "--protect" => o.protect.push(PathBuf::from(take("--protect")?)),
+            "--rollback-on-failure" => o.rollback_on_failure = true,
+            "--run-on-ask" => o.run_on_ask = true,
             "--" => {
                 o.rest.extend(args.by_ref());
                 break;
@@ -209,6 +220,16 @@ impl Style {
         };
         format!("\x1b[1;{code}m{}\x1b[0m", v.as_str().to_uppercase())
     }
+    /// For a message that is neither a verdict nor incidental — a rollback
+    /// happened and the reader needs to notice.
+    fn warn(&self, s: &str) -> String {
+        if self.on {
+            format!("\x1b[1;33m{s}\x1b[0m")
+        } else {
+            s.to_string()
+        }
+    }
+
     fn dim(&self, s: &str) -> String {
         if self.on {
             format!("\x1b[2m{s}\x1b[0m")
@@ -252,6 +273,76 @@ fn print_human(src: &str, d: &Decision) {
 
 fn print_json(src: &str, d: &Decision) {
     println!("{}", d.to_json(src));
+}
+
+// -------------------------------------------------------------------- run
+
+fn cmd_run(o: &Opts) -> Result<ExitCode, String> {
+    use shellguard_runtime::{Engine, RollbackPolicy};
+
+    let src = command_text(o)?;
+    let workspace = match &o.workspace {
+        Some(w) => w.clone(),
+        None => std::env::current_dir().map_err(|e| format!("cannot read cwd: {e}"))?,
+    };
+
+    let mut engine = Engine::new(&workspace)
+        .map_err(|e| format!("cannot open {}: {e}", workspace.display()))?
+        .run_on_ask(o.run_on_ask);
+    if let Some(ms) = o.deadline_ms {
+        engine = engine.with_timeout(Duration::from_millis(ms));
+    }
+    if o.rollback_on_failure || !o.protect.is_empty() {
+        engine = engine.with_rollback_policy(RollbackPolicy {
+            protected: o.protect.clone(),
+            on_nonzero_exit: o.rollback_on_failure,
+            ..Default::default()
+        });
+    }
+
+    let run = engine.execute_with_rollback(&src).map_err(|e| e.to_string())?;
+
+    if o.json {
+        println!("{}", run.to_json());
+        return Ok(exit_for(run.decision.verdict));
+    }
+
+    let st = Style::new();
+    if !run.ran() {
+        // Nothing ran, so the decision *is* the output.
+        print_human(&src, &run.decision);
+        return Ok(exit_for(run.decision.verdict));
+    }
+
+    let exec = run.exec.as_ref().expect("ran implies an execution");
+    print!("{}", String::from_utf8_lossy(&exec.stdout));
+    eprint!("{}", String::from_utf8_lossy(&exec.stderr));
+
+    if let Some(g) = &run.guard {
+        if g.rolled_back() {
+            eprintln!(
+                "{}",
+                st.warn(&format!("workspace reverted: {}", g.rollback_reasons.join("; ")))
+            );
+        }
+    }
+    eprintln!(
+        "{}",
+        st.dim(&format!(
+            "  {} in {} ({} runtime, exit {})",
+            run.decision.verdict.as_str(),
+            bench::fmt(exec.run),
+            engine.runtime_name(),
+            exec.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+        ))
+    );
+
+    // The command's own exit status, so `shellguard run` composes in a script
+    // the way the command it wrapped would have.
+    Ok(match exec.exit_code {
+        Some(c) if (0..=125).contains(&c) => ExitCode::from(c as u8),
+        _ => ExitCode::from(126),
+    })
 }
 
 // ---------------------------------------------------------------- profile

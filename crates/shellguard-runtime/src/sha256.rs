@@ -8,7 +8,7 @@
 //! command that modified something it should not have. Collision resistance is
 //! the property being relied on, so it has to be a hash that has it.
 //!
-//! Hand-written because the workspace carries no dependencies (DESIGN.md § 9)
+//! Hand-written because the workspace carries no dependencies (DESIGN.md § 10)
 //! and SHA-256 is small, fixed, and verifiable against published vectors —
 //! which is exactly the kind of thing worth writing rather than pulling in.
 

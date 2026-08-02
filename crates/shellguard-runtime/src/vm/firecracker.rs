@@ -167,7 +167,7 @@ impl Runtime for FirecrackerRuntime {
         // otherwise, it says so.
         let _ = payload;
         Err(RuntimeError::Unavailable(
-            "the Firecracker launch path is unverified; see DESIGN.md § 13".into(),
+            "the Firecracker launch path is unverified; see DESIGN.md § 12".into(),
         ))
     }
 }

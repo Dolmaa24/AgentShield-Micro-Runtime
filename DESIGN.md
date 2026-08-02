@@ -428,30 +428,115 @@ run commands in a Linux VM through Virtualization.framework rather than trust
 Seatbelt to be equivalent — and should amortise the ~1–2 s boot with a warm
 pool, because per-command VM startup is 100× the entire gate budget.
 
-## 7. Rollback — designed, not built
+## 7. Rollback: checkpoint and restore
 
-**Not implemented.** The design, for whoever picks it up:
-
-`git stash` is the wrong primitive: it mutates the working tree and races with
-a command that is still running. The right shape is to write objects without
-touching the index —
+**Built and verified.** An earlier draft of this document said `git stash` was
+the wrong primitive because it mutates the working tree. That is true of
+`git stash push` and **false of `git stash create`**, which was measured
+rather than assumed:
 
 ```
-tree=$(git write-tree)          # from the current index, into the odb only
-                                 # plus a second tree of hashed untracked files
+$ git status --porcelain      # before
+ D deleteme.txt
+ M tracked.txt
+?? untracked.txt
+$ git stash create
+b58a0f063c19a51662f3ef3ccd49fd69b5a7fa2d
+$ git status --porcelain      # after — identical
 ```
 
-— recording `{HEAD, tree, untracked_tree}` as a checkpoint, and restoring with
-`git read-tree -u --reset` followed by `git reset --soft`.
+`create` writes a commit object recording the worktree and index, prints its
+SHA, and touches nothing: not the worktree, not the index, not `refs/stash`. It
+does not race a command that is still running. It is exactly the right
+primitive.
 
-But that only covers files git tracks, and an agent's damage does not respect
-that boundary. The complete answer is filesystem-level: an **overlayfs upper
-layer** on Linux, or an **APFS snapshot** via `fs_snapshot_create` on macOS.
-Both are atomic, instant, and cover everything. The git-level checkpoint is
-worth having on top, because it is what produces a *reviewable diff* rather
-than an opaque revert.
+It also **does not capture untracked files** — `untracked.txt` is absent from
+the resulting tree — and that gap is the whole reason the state manager is more
+than three lines. An agent that *creates* a file and gets rolled back merely
+leaves it behind. An agent that *deletes* an untracked file loses it forever,
+because nothing ever recorded its contents. So untracked, non-ignored files are
+hashed into the object database separately with `git hash-object -w` and
+restored by hand.
 
-## 8. Failing closed
+A checkpoint is therefore `{HEAD, stash commit, untracked blobs, protected
+digests}`. Restoring moves `HEAD` back with `reset --soft` first — leaving the
+index and worktree alone — then `read-tree -u --reset` restores tracked files,
+then untracked files are written back from the object database.
+
+### What it deliberately does not cover
+
+Files outside the workspace, and files inside it that `.gitignore` excludes:
+`node_modules`, build output, `.env`. Capturing an ignored tree can mean copying
+gigabytes, and the workspace is the only thing the gate lets a command write
+anyway. Protected files close the gap for the specific paths that matter, by
+SHA-256 digest rather than by content — cryptographic, because a
+non-cryptographic hash would let a command modify a file and pad it back to the
+same checksum, which defeats the only thing the check is for.
+
+On Linux an overlayfs upper layer is the complete answer and cheaper than all of
+this. It is **not implemented**; the git path works on both platforms and was
+the higher-value half.
+
+### Rollback is itself destructive
+
+It overwrites files and can delete them. Every path it touches is checked to
+resolve inside the canonicalised workspace, resolving the deepest *existing*
+ancestor rather than normalising textually — a command can create
+`link -> /tmp/elsewhere` inside the workspace, and a restore that followed it
+would turn rollback into the exploit. Deleting untracked files that appeared
+after the checkpoint is opt-in: undoing a failed command is one thing, deleting
+a file the agent created is another, and that file may be the only record of
+what it was attempting.
+
+## 8. Where commands run
+
+Four runtimes behind one interface, so the choice is a deployment decision
+rather than a code change:
+
+| runtime | isolation | start | verified here |
+|---|---|---|---|
+| local (Seatbelt / Landlock+seccomp) | kernel sandbox | ~1–3 ms | **yes, against the kernel** |
+| gVisor | user-space kernel | ~50–150 ms | config only, no Linux host |
+| Firecracker | hardware VM | ~125 ms cold | config only, no Linux host |
+| Virtualization.framework | hardware VM | ~0.5–1.5 s cold | config validated, no guest kernel |
+
+The local runtime is the default and for most commands it should be. Isolation
+is a kernel sandbox rather than a VM, so a kernel bug is a full escape — but it
+starts in milliseconds, and paired with a checkpoint it makes the common failure
+(a command that damages the workspace) both contained and undoable. Reserving a
+VM for commands that warrant one is what keeps the system usable.
+
+### The 200 ms target
+
+**A cold VM boot cannot meet it.** Firecracker's well-known ~125 ms is a
+stripped kernel on KVM counting kernel boot alone; Virtualization.framework
+carries more overhead and takes closer to a second for a minimal Linux guest.
+Any design that boots per command has already lost by a factor of five to fifty.
+
+So the boot moves off the critical path. Slots are booted ahead of demand and
+parked; acquiring one is popping a queue. The target becomes an *acquisition*
+SLA, which is achievable and is the honest thing to measure. `PoolStats` counts
+warm hits and cold boots separately, so a pool that is quietly too small shows
+up as cold boots rather than as an unexplained latency tail.
+
+This is what production sandboxes do. It is not a way around the requirement; it
+is the requirement's only real implementation.
+
+### On gVisor and "Landlock inside the container"
+
+seccomp survives into the container: the OCI spec carries a seccomp profile and
+`runsc` applies it, generated from the same denylist the BPF filter uses so the
+two cannot drift.
+
+Landlock does not. gVisor implements the Linux syscall surface itself and does
+not implement `landlock_create_ruleset`; a ruleset built inside would fail at
+creation, and code that ignored that failure would believe it was confined when
+it was not. The filesystem scoping comes from the OCI mount set instead —
+read-only root, only the workspace mounted writable, `/proc` and `/sys` masked.
+The same effect by a different mechanism. Calling it Landlock would misdescribe
+the threat model.
+
+## 9. Failing closed
 
 Every failure path denies. This is the property that makes the budget safe
 rather than merely usually fast.
@@ -472,7 +557,7 @@ interesting case, and not the one to be lenient about. Without the deadline
 denying, the bypass would be "make evaluation slow" — arrangeable by an agent
 emitting adversarial input, and leaving no trace beyond a latency blip.
 
-## 9. Zero dependencies
+## 10. Zero dependencies
 
 Every crate has no external dependencies. About 10 400 lines of Rust, including
 a hand-written bash parser, an Aho-Corasick implementation, a policy-file
@@ -490,7 +575,7 @@ that bound the blast radius of a parser bug to a wrong verdict rather than a
 crash, and by memory safety, which is why Rust rather than C for code parsing
 adversarial input.
 
-## 10. The corpus is the specification
+## 11. The corpus is the specification
 
 145 commands with expected verdicts in `tests/corpus.txt`, kept **separate from
 the ruleset that implements them**. When a policy edit moves an entry, someone
@@ -514,39 +599,69 @@ A second test asserts the corpus keeps at least ten cases of *each* verdict. A
 corpus that drifts into being all-deny stops testing calibration, which is most
 of what a ruleset gets wrong.
 
-## 11. Known limitations
+## 12. Known limitations
 
 **The gate is not a boundary.** Stated in § 3 and repeated because it is the
 thing most likely to be forgotten. `Allow` means no rule objected.
 
-**Linux enforcement is unverified.** It compiles clean for `x86_64` and
-`aarch64` and the logic has unit tests, but it has never run against a Linux
-kernel — there is no Linux host here. The macOS path *is* verified end to end:
-tests confirm the kernel blocks a write outside the workspace and a read of
-`/etc/passwd` while ordinary work inside the workspace succeeds.
+**Only the local runtime has ever executed anything.** It is verified against
+the real kernel: a write outside the workspace and a read of `/etc/passwd` are
+both blocked while work inside succeeds. The other three are configuration and
+availability detection only —
 
-**Time-of-check to time-of-use in path classification.** The gate canonicalises
-the longest existing ancestor of a path, which catches a symlinked parent
-directory. It cannot catch a symlink created between the decision and the
-command running. This is not a bug to fix in the gate — it is why the gate is
-not the boundary. Landlock and Seatbelt evaluate at the moment of the syscall.
+- **Firecracker and gVisor**: no Linux host in this development environment.
+  Config generation is tested against the documented schemas; `execute()`
+  returns `Unavailable` with that reason rather than pretending.
+- **Virtualization.framework**: the Swift helper is real and its configuration
+  path is verified *against the framework* — it rejects a memory size below the
+  platform minimum and a missing kernel, and reports hardware support. Booting
+  needs a guest kernel image this repository does not ship and an in-guest
+  agent. The wire protocol that agent must speak is specified in
+  `vz::GUEST_PROTOCOL`, so what is missing is an image, not an interface.
 
-**Rollback is designed, not built** (§ 7).
+**The warm pool is not wired to a VM backend.** It is implemented and tested
+against a synthetic slow-booting backend, which exercises the acquisition SLA,
+refill, reuse and retirement. Connecting it to `VzRuntime` needs a
+persistent-helper mode in the Swift side, which cannot be tested without a
+guest.
 
-**No warm sandbox pool.** Each confined command pays profile setup. On macOS
-that is small; a VM-based deployment would need pooling.
+**overlayfs rollback is not implemented** (§ 7).
 
-**No audit log.** Decisions are returned, not persisted. A real deployment
-needs an append-only record, and it needs to be written by a supervisor
-*outside* the sandbox — which is why `macos::command` confines a child rather
-than the current process.
+**No audit log.** Decisions are returned, not persisted. A real deployment needs
+an append-only record written by a supervisor *outside* the sandbox — which is
+why the macOS runtime confines a child rather than the current process.
 
 **cgroups are not wired up.** `Profile` carries `max_processes` and
-`max_memory_bytes`, and on Linux nothing enforces them yet. Fork bombs are
-currently caught by a text rule, which is exactly as weak as it sounds.
+`max_memory_bytes` and on Linux nothing enforces them yet. Fork bombs are caught
+by a text rule, which is exactly as weak as it sounds.
+
+**Time-of-check to time-of-use in path classification.** The gate canonicalises
+the longest existing ancestor, which catches a symlinked parent. It cannot catch
+a symlink created between the decision and the command running. This is not a
+bug to fix in the gate — it is why the gate is not the boundary.
 
 **No policy hot-reload.** Changing rules requires restarting the gate.
 
-**Bundled short flags are not fully positional.** `-rf` decomposes into `r` and
-`f`, but the gate does not model which flags take values for arbitrary
-programs — only for the wrappers it unwraps.
+## 13. Findings from building it
+
+Things that were wrong and are now not. Recorded because each was found by
+running the thing rather than by reading it, which is the argument for the
+tests that found them.
+
+| what | how it was found |
+|---|---|
+| `sed`/`awk` blanket-allowed despite `sed -i` and `awk '{print > "f"}'` | writing the corpus |
+| `device.format` named `mkfs`, missing `mkfs.ext4` and every real invocation | writing the corpus |
+| a rule denying `>>` under a reason saying "truncates" | writing the corpus |
+| `--workspace` did not imply the working directory, so `rm -rf ./build` was denied | writing the README |
+| `fs.write` granted the **shared** `/tmp`, a standard pivot | a runtime test |
+| macOS profile made paths writable but not readable, so `echo x > f; cat f` failed | a runtime test |
+| a command matching no rule could not write in its own workspace | an engine test |
+| `validate()` used a fixed temp filename — a race and a symlink surface | parallel test execution |
+| macOS `python3`/`git` re-exec through `xcrun` into an unreadable `/Library/Developer` | the Python harness |
+| `prctl` declared twice with conflicting signatures; one would truncate a pointer | clippy |
+| inline `python3 -c` escalated to a human when the sandbox already contained it | the Python harness |
+
+The `git stash create` correction in § 7 belongs here too: the first draft of
+this document asserted it mutates the working tree. Measuring it showed
+otherwise.
