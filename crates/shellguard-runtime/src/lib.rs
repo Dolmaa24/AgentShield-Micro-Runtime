@@ -9,12 +9,16 @@
 //! acceptable for most commands — if a mistake is undoable, it does not have to
 //! be prevented.
 
+pub mod engine;
+pub mod json;
 pub mod local;
 pub mod pool;
 pub mod rollback;
 pub mod runtime;
 mod sha256;
+pub mod vm;
 
+pub use engine::{Engine, GuardedRun};
 pub use local::LocalRuntime;
 pub use pool::{Lease, Pool, PoolStats, Warm};
 pub use rollback::{
@@ -23,3 +27,4 @@ pub use rollback::{
 };
 pub use runtime::{Availability, ExecResult, Isolation, Payload, Runtime, RuntimeError};
 pub use sha256::{hash as sha256_hash, hash_file as sha256_file, hex as sha256_hex, Sha256};
+pub use vm::{FirecrackerRuntime, GvisorRuntime, VzRuntime};

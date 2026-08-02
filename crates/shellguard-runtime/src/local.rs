@@ -88,22 +88,8 @@ struct Scratch {
 
 impl Scratch {
     fn new() -> Result<Self, RuntimeError> {
-        // Unique without a random-number dependency: the pid distinguishes
-        // processes, the counter distinguishes executions within one, and the
-        // clock distinguishes runs that reuse a pid.
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        let name = format!(
-            "shellguard-scratch-{}-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed),
-            nanos
-        );
-        let path = std::env::temp_dir().join(name);
+        let path =
+            std::env::temp_dir().join(crate::runtime::unique_temp_name("shellguard-scratch"));
         std::fs::create_dir_all(&path)?;
         Ok(Scratch { path })
     }

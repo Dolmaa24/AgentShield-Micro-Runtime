@@ -46,14 +46,27 @@ const BASE_READ: &[&str] = &[
     "/System",
     "/Library/Frameworks",
     "/Library/Apple",
+    // The Command Line Tools. `/usr/bin/python3`, `/usr/bin/git` and friends
+    // on macOS are shims that re-exec through `xcrun` into here, so without it
+    // every one of them fails with a dlopen error about libxcrun that says
+    // nothing about sandboxing. Read and execute only, and it is Apple's
+    // toolchain rather than anyone's data.
+    "/Library/Developer",
     "/private/var/db/dyld",
     "/private/var/select",
     "/opt/homebrew",
     "/opt/local",
 ];
 
-const BASE_EXEC: &[&str] =
-    &["/usr/bin", "/usr/sbin", "/bin", "/sbin", "/usr/local/bin", "/opt/homebrew"];
+const BASE_EXEC: &[&str] = &[
+    "/usr/bin",
+    "/usr/sbin",
+    "/bin",
+    "/sbin",
+    "/usr/local/bin",
+    "/opt/homebrew",
+    "/Library/Developer",
+];
 
 const BASE_DEVICES: &[&str] = &[
     "/dev/null",
@@ -351,7 +364,14 @@ mod tests {
 
     fn run_confined(p: &Profile, script: &str) -> std::process::Output {
         let argv = command(p, "/bin/sh", &["-c", script]).unwrap();
-        Command::new(&argv[0]).args(&argv[1..]).output().expect("sandbox-exec should run")
+        Command::new(&argv[0])
+            .args(&argv[1..])
+            // Inside the workspace, as the runtime does. Inheriting the
+            // caller's directory means the shell cannot even `getcwd`, which
+            // fails in a way that looks nothing like the thing being tested.
+            .current_dir(ws())
+            .output()
+            .expect("sandbox-exec should run")
     }
 
     #[test]
@@ -380,6 +400,17 @@ mod tests {
         assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(std::fs::read_to_string(&target).unwrap().trim(), "ok");
         let _ = std::fs::remove_file(&target);
+    }
+
+    #[test]
+    fn the_command_line_tools_are_reachable() {
+        // `/usr/bin/python3` and `/usr/bin/git` on macOS re-exec through
+        // `xcrun` into /Library/Developer. Without it they fail with a dlopen
+        // error that gives no hint the sandbox caused it.
+        let p = Profile::from_capabilities(ws(), &[Capability::FsWrite]);
+        let out = run_confined(&p, "python3 -c 'print(1+1)'");
+        assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "2");
     }
 
     #[test]

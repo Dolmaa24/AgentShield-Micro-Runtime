@@ -272,6 +272,17 @@ pub struct Lease<W: Warm> {
     acquire: Duration,
 }
 
+// Hand-written rather than derived: the slot type is opaque and a derive would
+// force every backend's slot to be Debug for no benefit.
+impl<W: Warm> std::fmt::Debug for Lease<W> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lease")
+            .field("held", &self.slot.is_some())
+            .field("acquire", &self.acquire)
+            .finish()
+    }
+}
+
 impl<W: Warm> Lease<W> {
     pub fn get(&self) -> &W::Slot {
         self.slot.as_ref().expect("slot is present until drop")

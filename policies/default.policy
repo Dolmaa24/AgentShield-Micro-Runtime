@@ -64,8 +64,16 @@ rule shell.interpreter-c-computed deny
   cap shell.escape
 end
 
-rule shell.interpreter-inline ask
-  reason inline interpreter code can reach the shell through system() and equivalents
+# `confine`, not `ask`. Inline interpreter code genuinely can reach the shell —
+# `python3 -c "import os; os.system(...)"` is one import away — and this gate
+# cannot read Python to tell that from `print('hello')`. But that is the case
+# the sandbox exists for: inside it, the worst such code can reach is the
+# workspace, and the workspace is checkpointed. Escalating every `python3 -c`
+# to a human would make the tool unusable to buy protection the containment
+# layer already provides. The computed form stays denied above, because there
+# the *command* cannot be seen at all.
+rule shell.interpreter-inline confine
+  reason inline interpreter code can reach the shell, so it runs sandboxed rather than directly
   program python python3 perl ruby node deno php lua
   any
     arg-eq -c -e --eval --exec

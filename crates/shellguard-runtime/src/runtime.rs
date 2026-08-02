@@ -245,6 +245,21 @@ pub(crate) fn wait_timeout(
     }
 }
 
+/// A temp name unlikely to collide, without a random-number dependency.
+///
+/// A fixed filename here would be two bugs: concurrent callers clobber each
+/// other's file, and a predictable path in a shared directory is somewhere an
+/// attacker can plant a symlink before the write.
+pub(crate) fn unique_temp_name(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("{prefix}-{}-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed), nanos)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

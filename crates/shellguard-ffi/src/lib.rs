@@ -578,3 +578,237 @@ mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------- engine
+//
+// The gate answers "should this run". The engine answers "run it, and put the
+// workspace back if it goes wrong", which is what an agent harness actually
+// needs. Both are exposed because they are different questions: a harness may
+// want to judge a command, show the reason to a model, and never execute it.
+//
+// Results cross as JSON rather than as a struct with twenty accessors. The
+// shape is already an interface the CLI publishes, one serialiser is easier to
+// keep honest than two, and a caller in Python or Node has a JSON parser to
+// hand while it does not have a C struct layout.
+
+/// Roll back when the command exits non-zero.
+///
+/// Off by default: a failing command is not by itself a reason to discard the
+/// work it did, and a half-finished refactor is often worth keeping.
+pub const SG_ROLLBACK_ON_FAILURE: u32 = 1 << 0;
+
+/// Run commands the gate escalates instead of stopping at them.
+///
+/// Off by default. `Ask` means a human should look, and a harness that runs
+/// those anyway has replaced a decision with a default. Set it when there is
+/// genuinely a human in the loop, or when the containment and rollback layers
+/// are considered sufficient for the escalated class.
+pub const SG_RUN_ON_ASK: u32 = 1 << 1;
+
+#[derive(Debug)]
+pub struct sg_engine {
+    engine: shellguard_runtime::Engine,
+}
+
+/// Create an engine rooted at `workspace`.
+///
+/// # Safety
+/// `workspace` must be a valid NUL-terminated C string. `protected` may be
+/// NULL, or a NUL-terminated string of newline-separated paths that must not
+/// change. `err_out` must be NULL or a writable `char*`.
+#[no_mangle]
+pub unsafe extern "C" fn sg_engine_new(
+    workspace: *const c_char,
+    protected: *const c_char,
+    timeout_ms: u64,
+    flags: u32,
+    err_out: *mut *mut c_char,
+) -> *mut sg_engine {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: contract above.
+        let ws = unsafe { opt_str(workspace) }
+            .ok_or_else(|| "workspace must not be NULL".to_string())?
+            .to_str()
+            .map_err(|_| "workspace is not valid UTF-8".to_string())?;
+
+        let mut engine = shellguard_runtime::Engine::new(ws).map_err(|e| e.to_string())?;
+        if timeout_ms > 0 {
+            engine = engine.with_timeout(Duration::from_millis(timeout_ms));
+        }
+
+        // SAFETY: contract above.
+        let protected_paths: Vec<std::path::PathBuf> = match unsafe { opt_str(protected) } {
+            None => Vec::new(),
+            Some(list) => list
+                .to_str()
+                .map_err(|_| "protected list is not valid UTF-8")?
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(std::path::PathBuf::from)
+                .collect(),
+        };
+
+        // `on_nonzero_exit` is off in the library default, because a failing
+        // command is not by itself a reason to discard the work it did — a
+        // half-finished refactor is often worth keeping. A harness that wants
+        // all-or-nothing semantics asks for them here.
+        let rollback_on_failure = flags & SG_ROLLBACK_ON_FAILURE != 0;
+        if rollback_on_failure || !protected_paths.is_empty() {
+            engine = engine.with_rollback_policy(shellguard_runtime::RollbackPolicy {
+                protected: protected_paths,
+                on_nonzero_exit: rollback_on_failure,
+                ..Default::default()
+            });
+        }
+        if flags & SG_RUN_ON_ASK != 0 {
+            engine = engine.run_on_ask(true);
+        }
+
+        Ok::<_, String>(Box::into_raw(Box::new(sg_engine { engine })))
+    }));
+
+    match result {
+        Ok(Ok(p)) => p,
+        Ok(Err(msg)) => {
+            // SAFETY: contract above.
+            unsafe { write_err(err_out, &msg) };
+            std::ptr::null_mut()
+        }
+        Err(_) => {
+            // SAFETY: contract above.
+            unsafe { write_err(err_out, "panic while building the engine") };
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// # Safety
+/// `engine` must be NULL or a pointer from [`sg_engine_new`], not yet freed.
+#[no_mangle]
+pub unsafe extern "C" fn sg_engine_free(engine: *mut sg_engine) {
+    if engine.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees provenance.
+    let _ = catch_unwind(AssertUnwindSafe(|| drop(unsafe { Box::from_raw(engine) })));
+}
+
+/// The runtime backend in use, e.g. "local". Borrowed, valid for the process.
+///
+/// # Safety
+/// `engine` must be NULL or a valid pointer from [`sg_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn sg_engine_runtime(engine: *const sg_engine) -> *const c_char {
+    // SAFETY: the contract on this function is exactly `as_ref`'s.
+    match unsafe { engine.as_ref() } {
+        None => std::ptr::null(),
+        Some(e) => match e.engine.runtime_name() {
+            "local" => c"local".as_ptr(),
+            "vz" => c"vz".as_ptr(),
+            "firecracker" => c"firecracker".as_ptr(),
+            "gvisor" => c"gvisor".as_ptr(),
+            _ => c"unknown".as_ptr(),
+        },
+    }
+}
+
+/// Judge a command without running it. Returns owned JSON for
+/// [`sg_string_free`], or NULL if an argument was unusable.
+///
+/// # Safety
+/// `engine` must be valid and `command` a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn sg_engine_eval_json(
+    engine: *const sg_engine,
+    command: *const c_char,
+) -> *mut c_char {
+    if engine.is_null() || command.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: contract above.
+    let e = unsafe { &*engine };
+    // SAFETY: contract above.
+    let raw = unsafe { CStr::from_ptr(command) };
+
+    let out = catch_unwind(AssertUnwindSafe(|| {
+        let Ok(src) = raw.to_str() else {
+            // Not UTF-8, so it cannot be parsed as shell and nothing can be
+            // said about it. Refusing is the only defensible answer.
+            return cstring(
+                r#"{"verdict":"deny","complete":false,"incomplete":"command is not valid UTF-8","findings":[],"capabilities":[]}"#,
+            );
+        };
+        cstring(&e.engine.evaluate(src).to_json(src))
+    }));
+
+    match out {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Gate, checkpoint, execute, verify, roll back. Returns owned JSON for
+/// [`sg_string_free`], or NULL if an argument was unusable.
+///
+/// A command the gate refuses does not run, and that is reported in the JSON
+/// as `"ran": false` rather than as an error — refusing is a successful
+/// outcome, not a failure of the call.
+///
+/// # Safety
+/// `engine` must be valid and `command` a valid NUL-terminated C string. Not
+/// safe to call concurrently on one engine from several threads.
+#[no_mangle]
+pub unsafe extern "C" fn sg_engine_execute_json(
+    engine: *const sg_engine,
+    command: *const c_char,
+) -> *mut c_char {
+    if engine.is_null() || command.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: contract above.
+    let e = unsafe { &*engine };
+    // SAFETY: contract above.
+    let raw = unsafe { CStr::from_ptr(command) };
+
+    let out = catch_unwind(AssertUnwindSafe(|| {
+        let Ok(src) = raw.to_str() else {
+            return cstring(
+                r#"{"error":"command is not valid UTF-8","ran":false,"execution":null,"rollback":null}"#,
+            );
+        };
+        match e.engine.execute_with_rollback(src) {
+            Ok(run) => cstring(&run.to_json()),
+            Err(err) => {
+                let mut s = String::from("{\"error\":");
+                s.push_str(&json_escape(&err.to_string()));
+                s.push_str(",\"ran\":false,\"execution\":null,\"rollback\":null}");
+                cstring(&s)
+            }
+        }
+    }));
+
+    match out {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Minimal JSON string escaping for the error path above.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}

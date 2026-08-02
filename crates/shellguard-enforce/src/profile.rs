@@ -228,7 +228,7 @@ mod tests {
         for c in [Capability::FsWrite, Capability::FsDelete, Capability::PackageInstall] {
             let p = Profile::from_capabilities("/ws", &[c]);
             assert!(
-                !p.writable().iter().any(|w| *w == shared.as_path()),
+                !p.writable().contains(&shared.as_path()),
                 "{c:?} granted the shared temp directory"
             );
         }

@@ -85,6 +85,61 @@ size_t sg_decision_finding_count(const sg_decision *decision);
 const char *sg_decision_finding_rule(const sg_decision *decision, size_t index);
 const char *sg_decision_finding_reason(const sg_decision *decision, size_t index);
 
+/* ---------------------------------------------------------------- engine
+ *
+ * The gate answers "should this run". The engine answers "run it, and put the
+ * workspace back if it goes wrong". Both are exposed because they are
+ * different questions: a harness may want to judge a command, show the reason
+ * to a model, and never execute it.
+ *
+ * Engine results cross as JSON. The shape is already an interface the CLI
+ * publishes, one serialiser is easier to keep honest than two, and a caller in
+ * Python or Node has a JSON parser to hand while it does not have a C struct
+ * layout.
+ */
+
+typedef struct sg_engine sg_engine;
+
+/* Create an engine rooted at a workspace.
+ *
+ * workspace  the directory the agent may write to; must not be NULL
+ * protected  NULL, or newline-separated paths that must not change
+ * timeout_ms per-command execution budget; 0 for the default
+ * flags      SG_* below, OR-ed together
+ * err_out    on failure, receives an owned message for sg_string_free
+ *
+ * Returns NULL on failure. */
+
+/* Roll back when the command exits non-zero. Off by default: a failing command
+ * is not by itself a reason to discard the work it did. */
+#define SG_ROLLBACK_ON_FAILURE 1u
+
+/* Run commands the gate escalates instead of stopping at them. Off by default;
+ * SG_ASK means a human should look, and running those anyway replaces a
+ * decision with a default. */
+#define SG_RUN_ON_ASK 2u
+
+sg_engine *sg_engine_new(const char *workspace, const char *protected_paths,
+                         uint64_t timeout_ms, uint32_t flags, char **err_out);
+void sg_engine_free(sg_engine *engine);
+
+/* The runtime backend in use: "local", "vz", "firecracker", "gvisor". */
+const char *sg_engine_runtime(const sg_engine *engine);
+
+/* Judge a command without running it. Returns owned JSON for sg_string_free,
+ * or NULL if an argument was unusable. */
+char *sg_engine_eval_json(const sg_engine *engine, const char *command);
+
+/* Gate, checkpoint, execute, verify, roll back. Returns owned JSON for
+ * sg_string_free, or NULL if an argument was unusable.
+ *
+ * A command the gate refuses does not run, and that is reported in the JSON as
+ * "ran": false rather than as an error — refusing is a successful outcome of
+ * the call, not a failure of it.
+ *
+ * Not safe to call concurrently on one engine from several threads. */
+char *sg_engine_execute_json(const sg_engine *engine, const char *command);
+
 const char *sg_version(void);
 /* The confinement backend on this platform: "seatbelt", "landlock+seccomp",
  * or "none". */

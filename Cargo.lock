@@ -25,6 +25,7 @@ version = "0.1.0"
 dependencies = [
  "shellguard-gate",
  "shellguard-policy",
+ "shellguard-runtime",
 ]
 
 [[package]]
@@ -51,5 +52,6 @@ name = "shellguard-runtime"
 version = "0.1.0"
 dependencies = [
  "shellguard-enforce",
+ "shellguard-gate",
  "shellguard-policy",
 ]

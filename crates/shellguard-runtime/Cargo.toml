@@ -9,6 +9,7 @@ description = "Checkpoint and rollback, and the isolated execution runtimes comm
 
 [dependencies]
 shellguard-enforce = { path = "../shellguard-enforce" }
+shellguard-gate = { path = "../shellguard-gate" }
 shellguard-policy = { path = "../shellguard-policy" }
 
 [lints]

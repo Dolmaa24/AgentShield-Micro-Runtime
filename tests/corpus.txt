@@ -184,9 +184,9 @@ ask	launchctl load ~/Library/LaunchAgents/x.plist
 ask	echo alias=x >> ~/.zshrc
 ask	cat ~/.ssh/id_rsa
 ask	cat ~/.aws/credentials
-ask	python3 -c 'print(1)'
-ask	perl -e 'print 1'
-ask	node -e 'console.log(1)'
+confine	python3 -c 'print(1)'
+confine	perl -e 'print 1'
+confine	node -e 'console.log(1)'
 ask	$EDITOR notes.txt
 ask	$PYTHON script.py
 ask	rm -rf $TARGET

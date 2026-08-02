@@ -38,8 +38,10 @@
 //! Seatbelt to be equivalent. See DESIGN.md § 6.
 
 mod profile;
+mod syscalls;
 
 pub use profile::{EnforceError, Profile};
+pub use syscalls::DENIED as DENIED_SYSCALLS;
 
 #[cfg(target_os = "macos")]
 pub mod macos;
