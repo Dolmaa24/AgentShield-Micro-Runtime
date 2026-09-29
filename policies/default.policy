@@ -516,19 +516,6 @@ rule credentials.sensitive-files deny
   cap cred.access
 end
 
-
-rule network.exfiltration-tools deny
-  reason network utility capable of data exfiltration
-  program curl wget nc netcat socat ncat
-  cap net.connect
-end
-
-rule credentials.sensitive-files deny
-  reason accessing sensitive credential or key files
-  arg-prefix .env .env. .aws/ id_rsa id_ed25519 .pem .key
-  cap cred.access
-end
-
 rule obfuscation.base64-decode deny
   reason obfuscated command payload decoding via base64
   program base64

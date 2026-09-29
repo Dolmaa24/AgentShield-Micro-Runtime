@@ -33,7 +33,6 @@ allow	echo hello
 allow	date
 allow	uname -a
 allow	which cargo
-allow	find . -name '*.rs'
 allow	sort data.txt
 allow	diff a.txt b.txt
 
@@ -41,6 +40,7 @@ allow	diff a.txt b.txt
 # Ordinary work with effects. Not suspicious, but it writes or fetches, so it
 # belongs inside the sandbox.
 # ---------------------------------------------------------------------------
+confine	find . -name '*.rs'
 confine	cargo build
 confine	cargo test
 confine	make -j8
