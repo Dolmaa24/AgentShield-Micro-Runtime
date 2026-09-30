@@ -627,9 +627,23 @@ guest.
 
 **overlayfs rollback is not implemented** (§ 7).
 
-**No audit log.** Decisions are returned, not persisted. A real deployment needs
-an append-only record written by a supervisor *outside* the sandbox — which is
-why the macOS runtime confines a child rather than the current process.
+**The audit log is not tamper-evident, and sees only what goes through the
+engine** (§ 14). It keeps the *sandboxed command* out — verified at both the
+gate and the kernel — but there is no hash chain or signature, so a process
+running as the same user outside the sandbox can rewrite it. It also cannot
+record a command that was run some other way, which is why every file's header
+says so.
+
+**An unexplained intermittent refusal on a cold start.** Twice in 56 runs of the
+affected tests — once in a Rust engine test, once in the Python suite, both
+immediately after a rebuild — a benign command came back without having run. It
+does not reproduce on demand: 12 warm runs, 10 runs under 16 busy loops on 8
+cores, and 30 fresh Python runs all passed. The leading hypothesis is the gate's
+10 ms deadline failing closed on a cold filesystem cache (path resolution
+`stat`s), so a legitimate first command comes back `ask`. That is a hypothesis,
+not a finding. The failing assertions now print the verdict and the incomplete
+reason, and the audit log records `"complete":false` with it, so the next
+occurrence explains itself.
 
 **cgroups are not wired up.** `Profile` carries `max_processes` and
 `max_memory_bytes` and on Linux nothing enforces them yet. Fork bombs are caught
@@ -661,7 +675,97 @@ tests that found them.
 | macOS `python3`/`git` re-exec through `xcrun` into an unreadable `/Library/Developer` | the Python harness |
 | `prctl` declared twice with conflicting signatures; one would truncate a pointer | clippy |
 | inline `python3 -c` escalated to a human when the sandbox already contained it | the Python harness |
+| a "60 concurrent processes" log test passed without ever rotating (default threshold 8 MiB), so it proved less than it claimed | reading the file sizes in its own output |
+| test helpers for the log and the repo resolved to one directory, so creating the log deleted the repository under test | an engine test finding `tracked.txt` missing |
+| "stdout is not recorded" asserted against a string the command text itself contains, which is (correctly) recorded | the test failing on the wrong thing |
+| a tamper test that only let the gate refuse the command said nothing about the kernel | asking which layer had stopped it |
 
 The `git stash create` correction in § 7 belongs here too: the first draft of
 this document asserted it mutates the working tree. Measuring it showed
 otherwise.
+
+## 14. The audit log
+
+`--audit FILE` (CLI), `sg_engine_set_audit` (C ABI) and `audit_log=` (Python)
+attach an append-only record of what was judged, what ran, and what was undone.
+The implementation is `audit.rs` and `redact.rs` in `shellguard-runtime`.
+
+**Why it exists.** A rolled-back command leaves no trace on disk by design, so
+without a record the only evidence a defence worked is the absence of damage —
+which is also what a defence that never fired looks like.
+
+**What is written.** One JSON object per line:
+
+| `kind` | when |
+|---|---|
+| `header` | first line of every file, including after rotation |
+| `evaluate` | a command was judged and not asked to run |
+| `refused` | a command was submitted to run and the gate stopped it |
+| `start` | a command is about to run — before the checkpoint |
+| `finish` | that command ended (same `id` as its `start`) |
+| `error` | that command could not be run to completion (same `id`) |
+
+Execution is two records, not one, for a reason. A process that dies mid-command
+never writes its `finish`, and a `start` with no matching `finish` is the trace
+such a death should leave. It is also what gives `--audit-required` meaning: the
+record that must succeed is the one written *before* the command runs.
+
+**What is deliberately not written.**
+
+- Output, unless `--audit-verbose`. Output is where credentials most often
+  appear.
+- The environment, ever.
+- Anything derived from the command text, un-redacted. `redact.rs` recognises
+  prefixed tokens (AWS, GitHub, Slack, Stripe, OpenAI/Anthropic-style, JWTs),
+  `key=value` / `"key": "value"` / `--flag value` pairs with sensitive names,
+  `Authorization` and cookie headers, `Bearer` tokens, `user:password@` in URLs,
+  and PEM private-key blocks. It is **best-effort**: a bare high-entropy string
+  with no recognisable prefix and no telling name beside it passes through,
+  because git hashes look identical and a log where every hash is `[REDACTED]`
+  is unreadable. Over-redaction is the accepted failure mode. Redaction runs
+  *before* truncation, so a token cannot be cut in half and slip past the
+  patterns.
+
+**Integrity.** The writer is the supervisor, outside the sandbox — the same
+reason the macOS runtime confines a child rather than the current process. The
+file is created `0600`; an existing file that is group- or world-writable is
+refused; a symlinked path is refused (a check-then-open, so it stops the
+accident and the lazy attack, not a determined local one). A command cannot
+write into its own log, and that is held by two independent layers, each
+exercised on its own: by default the gate escalates the write (`fs.append-outside`),
+and when forced past the gate (`run_on_ask`) the kernel returns `EPERM`.
+
+It is **not tamper-evident**: there is no hash chain and no signature, so
+another process running as the same user, outside the sandbox, can rewrite it.
+
+**Concurrency and growth.** Each CLI invocation is its own process, so
+in-process locking is not enough. Every write takes an `flock` on a sidecar
+file, checks the size, rotates if needed, and appends the whole line in one
+`write`. Rotation is by size (`audit.jsonl` → `.1` → … → `.N`), and each new file
+starts with a header. Verified with 60 separate processes and rotation forced
+mid-run: 3 files, 60 of 60 records, one header per file, nothing lost, repeated
+or torn. Records are bounded (fields are capped on their *escaped* length, never
+mid-escape), so a record cannot exceed the file.
+
+**Failure is never silent.** Failing to *open* the log is always an error.
+Failing to *write* is counted (`sg_engine_audit_failures`,
+`SandboxEngine.audit_failures`) and reported on the run (`audit_error`, and on
+stderr from the CLI). Whether it also stops the command is a choice:
+
+| | a write fails | exit |
+|---|---|---|
+| default | the command still runs; the failure is reported | — |
+| `--audit-required` | the command does not run | 65 |
+
+The default is best-effort because a full disk should not make every command
+fail; `required` is for when an unaudited command is worse than a refused one.
+
+**Cost.** Measured through the Python binding on the release library, 3,000
+judgments: p50 53 µs without a log, 112 µs with one (+59 µs); p99 255 µs. About
+1% of the 10 ms budget. The price is a lock, an open and a write per record,
+paid so that concurrent processes cannot corrupt each other.
+
+**What it cannot tell you.** Only commands submitted to an engine holding the
+log appear in it. A command run any other way is invisible, and a quiet log is
+not evidence of a quiet agent. Each file's header carries a `coverage` field
+saying so, so the caveat travels with the data.

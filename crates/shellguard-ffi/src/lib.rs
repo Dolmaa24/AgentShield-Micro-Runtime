@@ -605,6 +605,18 @@ pub const SG_ROLLBACK_ON_FAILURE: u32 = 1 << 0;
 /// are considered sufficient for the escalated class.
 pub const SG_RUN_ON_ASK: u32 = 1 << 1;
 
+/// Also record the command's stdout and stderr in the audit log (redacted).
+///
+/// Off by default: output is where credentials most often appear, and a log
+/// that records it has to be protected like the credentials themselves.
+pub const SG_AUDIT_VERBOSE: u32 = 1 << 0;
+
+/// Refuse to run a command whose audit record cannot be written.
+///
+/// Off by default, because a full disk should not stop every command. Set it
+/// when an unaudited command is worse than a refused one.
+pub const SG_AUDIT_REQUIRED: u32 = 1 << 1;
+
 #[derive(Debug)]
 pub struct sg_engine {
     engine: shellguard_runtime::Engine,
@@ -713,6 +725,80 @@ pub unsafe extern "C" fn sg_engine_runtime(engine: *const sg_engine) -> *const c
     }
 }
 
+/// Attach an audit log to an engine. Returns 0, or -1 with a message in
+/// `err_out` (for [`sg_string_free`]).
+///
+/// Failing to open the log is always an error here, whatever `flags` say:
+/// `SG_AUDIT_REQUIRED` governs what happens when a *write* fails later, not
+/// whether a log that cannot be opened at all is acceptable. Unknown flag bits
+/// are rejected rather than ignored, so a typo does not silently turn a
+/// requirement off.
+///
+/// # Safety
+/// `engine` must be NULL or a valid pointer from [`sg_engine_new`]; `path` a
+/// valid NUL-terminated C string; `err_out` NULL or a writable `char*`. Not
+/// safe to call concurrently with any other call on the same engine.
+#[no_mangle]
+pub unsafe extern "C" fn sg_engine_set_audit(
+    engine: *mut sg_engine,
+    path: *const c_char,
+    flags: u32,
+    err_out: *mut *mut c_char,
+) -> i32 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: contract above.
+        let e = unsafe { engine.as_mut() }.ok_or("engine must not be NULL")?;
+        // SAFETY: contract above.
+        let p = unsafe { opt_str(path) }
+            .ok_or("audit path must not be NULL")?
+            .to_str()
+            .map_err(|_| "audit path is not valid UTF-8")?;
+        if flags & !(SG_AUDIT_VERBOSE | SG_AUDIT_REQUIRED) != 0 {
+            return Err(format!(
+                "unknown audit flags {:#x}",
+                flags & !(SG_AUDIT_VERBOSE | SG_AUDIT_REQUIRED)
+            ));
+        }
+
+        let cfg = shellguard_runtime::audit::AuditConfig::new(p)
+            .source("ffi")
+            .verbose(flags & SG_AUDIT_VERBOSE != 0)
+            .required(flags & SG_AUDIT_REQUIRED != 0);
+        let log = shellguard_runtime::audit::AuditLog::open(cfg)
+            .map_err(|err| format!("cannot open audit log {p}: {err}"))?;
+        e.engine.set_audit(log);
+        Ok::<_, String>(())
+    }));
+
+    match result {
+        Ok(Ok(())) => 0,
+        Ok(Err(msg)) => {
+            // SAFETY: contract above.
+            unsafe { write_err(err_out, &msg) };
+            -1
+        }
+        Err(_) => {
+            // SAFETY: contract above.
+            unsafe { write_err(err_out, "panic while opening the audit log") };
+            -1
+        }
+    }
+}
+
+/// How many audit records failed to write since the log was attached. Zero for
+/// NULL or an engine with no log.
+///
+/// A best-effort log that starts failing is otherwise silent; this is the
+/// number to alert on.
+///
+/// # Safety
+/// `engine` must be NULL or a valid pointer from [`sg_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn sg_engine_audit_failures(engine: *const sg_engine) -> u64 {
+    // SAFETY: the contract on this function is exactly `as_ref`'s.
+    unsafe { engine.as_ref() }.map_or(0, |e| e.engine.audit_failures())
+}
+
 /// Judge a command without running it. Returns owned JSON for
 /// [`sg_string_free`], or NULL if an argument was unusable.
 ///
@@ -811,4 +897,202 @@ fn json_escape(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod audit_tests {
+    // Same reasoning as `tests` above: every call crosses the C boundary, and
+    // every pointer comes from a constructor in this module and is freed once.
+    #![allow(clippy::undocumented_unsafe_blocks)]
+
+    use super::*;
+    use shellguard_runtime::json;
+    use std::path::Path;
+
+    fn c(s: &str) -> CString {
+        CString::new(s).unwrap()
+    }
+
+    /// A scratch directory holding a workspace and, beside it, the log's own.
+    struct Sandbox {
+        root: PathBuf,
+    }
+
+    impl Sandbox {
+        fn new(name: &str) -> Sandbox {
+            let root = std::env::temp_dir()
+                .join(format!("shellguard-ffi-audit-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("ws")).unwrap();
+            Sandbox { root: root.canonicalize().unwrap() }
+        }
+        fn ws(&self) -> PathBuf {
+            self.root.join("ws")
+        }
+        fn log_dir(&self) -> PathBuf {
+            self.root.join("log")
+        }
+        fn log(&self) -> PathBuf {
+            self.log_dir().join("audit.jsonl")
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn new_engine(ws: &Path) -> *mut sg_engine {
+        let w = c(ws.to_str().unwrap());
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let e = unsafe { sg_engine_new(w.as_ptr(), std::ptr::null(), 0, 0, &mut err) };
+        assert!(!e.is_null(), "sg_engine_new failed");
+        e
+    }
+
+    fn set_audit(e: *mut sg_engine, path: &Path, flags: u32) -> Result<(), String> {
+        let p = c(path.to_str().unwrap());
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe { sg_engine_set_audit(e, p.as_ptr(), flags, &mut err) };
+        if rc == 0 {
+            assert!(err.is_null());
+            Ok(())
+        } else {
+            assert!(!err.is_null(), "failure with no message");
+            let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap().to_string();
+            unsafe { sg_string_free(err) };
+            Err(msg)
+        }
+    }
+
+    fn execute(e: *mut sg_engine, cmd: &str) -> json::Json {
+        let s = c(cmd);
+        let out = unsafe { sg_engine_execute_json(e, s.as_ptr()) };
+        assert!(!out.is_null());
+        let text = unsafe { CStr::from_ptr(out) }.to_str().unwrap().to_string();
+        unsafe { sg_string_free(out) };
+        json::parse(&text).unwrap_or_else(|e| panic!("{e}: {text}"))
+    }
+
+    fn kinds(log: &Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                json::parse(l)
+                    .unwrap()
+                    .get("kind")
+                    .and_then(json::Json::as_str)
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_audited_engine_records_what_it_runs() {
+        let sb = Sandbox::new("records");
+        let e = new_engine(&sb.ws());
+        set_audit(e, &sb.log(), 0).unwrap();
+
+        let v = execute(e, "echo hello");
+        assert_eq!(v.get("ran").and_then(json::Json::as_bool), Some(true));
+        assert_eq!(v.get("audit_error"), Some(&json::Json::Null));
+        assert_eq!(kinds(&sb.log()), ["header", "start", "finish"]);
+        assert_eq!(unsafe { sg_engine_audit_failures(e) }, 0);
+
+        unsafe { sg_engine_free(e) };
+    }
+
+    #[test]
+    fn the_header_says_the_log_was_opened_through_the_c_abi() {
+        let sb = Sandbox::new("source");
+        let e = new_engine(&sb.ws());
+        set_audit(e, &sb.log(), SG_AUDIT_VERBOSE | SG_AUDIT_REQUIRED).unwrap();
+        let header = std::fs::read_to_string(sb.log()).unwrap();
+        let h = json::parse(header.lines().next().unwrap()).unwrap();
+        assert_eq!(h.get("source").and_then(json::Json::as_str), Some("ffi"));
+        assert_eq!(h.get("verbose").and_then(json::Json::as_bool), Some(true));
+        assert_eq!(h.get("required").and_then(json::Json::as_bool), Some(true));
+        unsafe { sg_engine_free(e) };
+    }
+
+    #[test]
+    fn bad_arguments_are_errors_with_messages_not_crashes() {
+        let sb = Sandbox::new("badargs");
+        let e = new_engine(&sb.ws());
+        let good = sb.log();
+
+        // NULL engine.
+        let p = c(good.to_str().unwrap());
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe { sg_engine_set_audit(std::ptr::null_mut(), p.as_ptr(), 0, &mut err) };
+        assert_eq!(rc, -1);
+        unsafe { sg_string_free(err) };
+
+        // NULL path.
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe { sg_engine_set_audit(e, std::ptr::null(), 0, &mut err) };
+        assert_eq!(rc, -1);
+        unsafe { sg_string_free(err) };
+
+        // NULL err_out is tolerated.
+        let rc = unsafe { sg_engine_set_audit(e, std::ptr::null(), 0, std::ptr::null_mut()) };
+        assert_eq!(rc, -1);
+
+        // Unknown flag bits are refused, not ignored.
+        let msg = set_audit(e, &good, 1 << 7).unwrap_err();
+        assert!(msg.contains("unknown audit flags"), "{msg}");
+        assert!(!good.exists(), "a rejected call still created the log");
+
+        // A directory is not a log.
+        assert!(set_audit(e, &sb.ws(), 0).is_err());
+
+        unsafe { sg_engine_free(e) };
+    }
+
+    #[test]
+    fn audit_failures_of_a_null_or_unaudited_engine_is_zero() {
+        assert_eq!(unsafe { sg_engine_audit_failures(std::ptr::null()) }, 0);
+        let sb = Sandbox::new("nolog");
+        let e = new_engine(&sb.ws());
+        assert_eq!(unsafe { sg_engine_audit_failures(e) }, 0);
+        unsafe { sg_engine_free(e) };
+    }
+
+    #[test]
+    fn a_best_effort_log_that_fails_is_reported_in_the_result_and_the_counter() {
+        let sb = Sandbox::new("besteffort");
+        let e = new_engine(&sb.ws());
+        set_audit(e, &sb.log(), 0).unwrap();
+        std::fs::remove_dir_all(sb.log_dir()).unwrap();
+
+        let v = execute(e, "echo ran > marker.txt");
+        assert_eq!(v.get("ran").and_then(json::Json::as_bool), Some(true));
+        assert!(v.get("audit_error").and_then(json::Json::as_str).is_some(), "{v:?}");
+        assert!(sb.ws().join("marker.txt").exists());
+        assert!(unsafe { sg_engine_audit_failures(e) } >= 2);
+
+        unsafe { sg_engine_free(e) };
+    }
+
+    #[test]
+    fn a_required_log_that_fails_refuses_the_command() {
+        let sb = Sandbox::new("required");
+        let e = new_engine(&sb.ws());
+        set_audit(e, &sb.log(), SG_AUDIT_REQUIRED).unwrap();
+        std::fs::remove_dir_all(sb.log_dir()).unwrap();
+
+        let v = execute(e, "echo ran > marker.txt");
+        assert_eq!(v.get("ran").and_then(json::Json::as_bool), Some(false));
+        let why = v.get("error").and_then(json::Json::as_str).expect("an error message");
+        assert!(why.contains("not run"), "{why}");
+        assert!(
+            !sb.ws().join("marker.txt").exists(),
+            "the command ran although it could not be recorded"
+        );
+
+        unsafe { sg_engine_free(e) };
+    }
 }

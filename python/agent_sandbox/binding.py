@@ -52,6 +52,11 @@ ROLLBACK_ON_FAILURE = 1 << 0
 #: Run commands the gate escalates rather than stopping at them.
 RUN_ON_ASK = 1 << 1
 
+#: Audit log: also record stdout and stderr (redacted).
+AUDIT_VERBOSE = 1 << 0
+#: Audit log: refuse to run a command whose record cannot be written.
+AUDIT_REQUIRED = 1 << 1
+
 
 class SandboxError(RuntimeError):
     """The engine could not be built, or the library misbehaved."""
@@ -134,6 +139,12 @@ def _bind(lib: ctypes.CDLL) -> None:
 
     lib.sg_engine_runtime.argtypes = [ctypes.c_void_p]
     lib.sg_engine_runtime.restype = c
+
+    lib.sg_engine_set_audit.argtypes = [ctypes.c_void_p, c, ctypes.c_uint32, ctypes.POINTER(p)]
+    lib.sg_engine_set_audit.restype = ctypes.c_int
+
+    lib.sg_engine_audit_failures.argtypes = [ctypes.c_void_p]
+    lib.sg_engine_audit_failures.restype = ctypes.c_uint64
 
     # Returned as a raw pointer, never as c_char_p: ctypes converts c_char_p to
     # bytes and discards the pointer, so the allocation could never be freed.
@@ -279,6 +290,10 @@ class ExecutionResult:
     changed_protected: tuple[str, ...] = ()
     acquire_ms: float = 0.0
     run_ms: float = 0.0
+    #: Why this run could not be fully recorded in the audit log, or ``None``.
+    #: Always ``None`` when no audit log is configured. A best-effort log that
+    #: fails does not raise; this is where it says so.
+    audit_error: str | None = None
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @property
@@ -319,6 +334,7 @@ class ExecutionResult:
             changed_protected=tuple(rb.get("changed_protected", ())),
             acquire_ms=float(ex.get("acquire_ms", 0.0)),
             run_ms=float(ex.get("run_ms", 0.0)),
+            audit_error=d.get("audit_error"),
             raw=d,
         )
 
@@ -349,6 +365,9 @@ class SandboxEngine:
         timeout: float | None = None,
         rollback_on_failure: bool = False,
         run_on_ask: bool = False,
+        audit_log: str | os.PathLike[str] | None = None,
+        audit_verbose: bool = False,
+        audit_required: bool = False,
         library: str | os.PathLike[str] | None = None,
     ) -> None:
         if library is not None:
@@ -363,6 +382,12 @@ class SandboxEngine:
         self._timeout_ms = int(timeout * 1000) if timeout else 0
         self._flags = (ROLLBACK_ON_FAILURE if rollback_on_failure else 0) | (
             RUN_ON_ASK if run_on_ask else 0
+        )
+        if (audit_verbose or audit_required) and audit_log is None:
+            raise SandboxError("audit_verbose and audit_required need audit_log=<path>")
+        self._audit_path = str(Path(audit_log).resolve()) if audit_log is not None else None
+        self._audit_flags = (AUDIT_VERBOSE if audit_verbose else 0) | (
+            AUDIT_REQUIRED if audit_required else 0
         )
         self._engines: dict[Path, int] = {}
         self._lock = threading.Lock()
@@ -402,6 +427,20 @@ class SandboxEngine:
     def backend(self) -> str:
         """The kernel confinement backend: 'seatbelt' or 'landlock+seccomp'."""
         return self._lib.sg_backend().decode()
+
+    @property
+    def audit_failures(self) -> int:
+        """Audit records that failed to write, summed over every workspace.
+
+        Zero with no audit log. Worth alerting on: a best-effort log that starts
+        failing does not raise, so this counter (and ``ExecutionResult.audit_error``)
+        is the only sign that the record has gaps.
+        """
+        with self._lock:
+            return sum(
+                int(self._lib.sg_engine_audit_failures(ctypes.c_void_p(h)))
+                for h in self._engines.values()
+            )
 
     def runtime(self, workspace: str | os.PathLike[str] | None = None) -> str:
         """The execution runtime: 'local', 'vz', 'firecracker', 'gvisor'."""
@@ -470,6 +509,21 @@ class SandboxEngine:
                 if err:
                     message = _take_string(self._lib, err)
                 raise SandboxError(f"{message} (workspace: {workspace})")
+
+            if self._audit_path is not None:
+                err = ctypes.POINTER(ctypes.c_char)()
+                rc = self._lib.sg_engine_set_audit(
+                    ctypes.c_void_p(handle),
+                    self._audit_path.encode(),
+                    ctypes.c_uint32(self._audit_flags),
+                    ctypes.byref(err),
+                )
+                if rc != 0:
+                    message = _take_string(self._lib, err) if err else "sg_engine_set_audit failed"
+                    # Do not leave a half-configured engine behind: one that
+                    # silently runs commands with no log, when a log was asked for.
+                    self._lib.sg_engine_free(ctypes.c_void_p(handle))
+                    raise SandboxError(message)
 
             self._engines[workspace] = handle
             return handle

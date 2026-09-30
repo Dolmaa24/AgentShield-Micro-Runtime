@@ -9,10 +9,12 @@
 //! acceptable for most commands — if a mistake is undoable, it does not have to
 //! be prevented.
 
+pub mod audit;
 pub mod engine;
 pub mod json;
 pub mod local;
 pub mod pool;
+pub mod redact;
 pub mod rollback;
 pub mod runtime;
 mod sha256;

@@ -33,6 +33,13 @@ OPTIONS:
         --protect PATH     a file that must not change (repeatable; run only)
         --rollback-on-failure  revert if the command exits non-zero (run only)
         --run-on-ask       run commands the gate escalates (run only)
+        --audit FILE       append every judgment and execution to FILE as JSON
+                           lines, secrets redacted (also: $SHELLGUARD_AUDIT)
+        --audit-verbose    also record stdout and stderr, redacted (run only)
+        --audit-required   refuse to run, or answer, if the record cannot be
+                           written (default: warn and carry on)
+        --audit-max-bytes N  rotate the log at N bytes (default 8 MiB, min 128 KiB)
+        --audit-keep N     rotated files to keep (default 5; 0 keeps none)
     -h, --help             this text
     -V, --version          version and backend
 
@@ -62,6 +69,11 @@ struct Opts {
     protect: Vec<PathBuf>,
     rollback_on_failure: bool,
     run_on_ask: bool,
+    audit: Option<PathBuf>,
+    audit_verbose: bool,
+    audit_required: bool,
+    audit_max_bytes: Option<u64>,
+    audit_keep: Option<usize>,
     rest: Vec<String>,
 }
 
@@ -122,6 +134,17 @@ fn parse_opts(args: impl Iterator<Item = String>) -> Result<Opts, String> {
             "--protect" => o.protect.push(PathBuf::from(take("--protect")?)),
             "--rollback-on-failure" => o.rollback_on_failure = true,
             "--run-on-ask" => o.run_on_ask = true,
+            "--audit" => o.audit = Some(PathBuf::from(take("--audit")?)),
+            "--audit-verbose" => o.audit_verbose = true,
+            "--audit-required" => o.audit_required = true,
+            "--audit-max-bytes" => {
+                let v = take("--audit-max-bytes")?;
+                o.audit_max_bytes = Some(v.parse().map_err(|_| format!("bad size `{v}`"))?);
+            }
+            "--audit-keep" => {
+                let v = take("--audit-keep")?;
+                o.audit_keep = Some(v.parse().map_err(|_| format!("bad count `{v}`"))?);
+            }
             "--" => {
                 o.rest.extend(args.by_ref());
                 break;
@@ -133,6 +156,39 @@ fn parse_opts(args: impl Iterator<Item = String>) -> Result<Opts, String> {
         }
     }
     Ok(o)
+}
+
+/// Open the audit log if one was asked for, by flag or by `$SHELLGUARD_AUDIT`.
+///
+/// A log that was asked for and cannot be opened is an error, not a warning:
+/// the caller believes they are being recorded. The flag wins over the
+/// environment, so a one-off invocation can redirect it.
+fn open_audit(o: &Opts) -> Result<Option<shellguard_runtime::audit::AuditLog>, String> {
+    use shellguard_runtime::audit::{AuditConfig, AuditLog};
+
+    let path = o.audit.clone().or_else(|| {
+        std::env::var_os("SHELLGUARD_AUDIT").filter(|v| !v.is_empty()).map(PathBuf::from)
+    });
+    let Some(path) = path else {
+        if o.audit_verbose
+            || o.audit_required
+            || o.audit_max_bytes.is_some()
+            || o.audit_keep.is_some()
+        {
+            return Err("the --audit-* options need --audit FILE (or $SHELLGUARD_AUDIT)".into());
+        }
+        return Ok(None);
+    };
+    let mut cfg =
+        AuditConfig::new(&path).source("cli").verbose(o.audit_verbose).required(o.audit_required);
+    if o.audit_max_bytes.is_some() || o.audit_keep.is_some() {
+        let (bytes, keep) =
+            (o.audit_max_bytes.unwrap_or(cfg.max_bytes), o.audit_keep.unwrap_or(cfg.keep));
+        cfg = cfg.rotate_at(bytes, keep);
+    }
+    AuditLog::open(cfg)
+        .map(Some)
+        .map_err(|e| format!("cannot open audit log {}: {e}", path.display()))
 }
 
 fn build_gate(o: &Opts) -> Result<Gate, String> {
@@ -188,9 +244,27 @@ fn exit_for(v: Verdict) -> ExitCode {
 
 fn cmd_eval(o: &Opts) -> Result<ExitCode, String> {
     let gate = build_gate(o)?;
+    let audit = open_audit(o)?;
     let src = command_text(o)?;
     let mut worker = Worker::new();
     let d = gate.evaluate(&src, &mut worker);
+
+    // Recorded before the answer is printed, so that with `--audit-required`
+    // a caller never receives a verdict that was not written down.
+    if let Some(log) = &audit {
+        let workspace = match &o.workspace {
+            Some(w) => w.clone(),
+            None => std::env::current_dir().map_err(|e| format!("cannot read cwd: {e}"))?,
+        };
+        if let Err(e) = log.evaluated(&src, &d, &workspace) {
+            eprintln!("shellguard: audit: could not record this judgment: {e}");
+            if log.required() {
+                // Not a verdict exit code: a caller must not mistake this for
+                // an allow, a confine, an ask or a deny.
+                return Ok(ExitCode::from(65));
+            }
+        }
+    }
 
     if o.json {
         print_json(&src, &d);
@@ -289,6 +363,9 @@ fn cmd_run(o: &Opts) -> Result<ExitCode, String> {
     let mut engine = Engine::new(&workspace)
         .map_err(|e| format!("cannot open {}: {e}", workspace.display()))?
         .run_on_ask(o.run_on_ask);
+    if let Some(log) = open_audit(o)? {
+        engine = engine.with_audit(log);
+    }
     if let Some(ms) = o.deadline_ms {
         engine = engine.with_timeout(Duration::from_millis(ms));
     }
@@ -300,7 +377,19 @@ fn cmd_run(o: &Opts) -> Result<ExitCode, String> {
         });
     }
 
-    let run = engine.execute_with_rollback(&src).map_err(|e| e.to_string())?;
+    let run = match engine.execute_with_rollback(&src) {
+        Ok(r) => r,
+        // Stopped on purpose, before the command started, because it could not
+        // be recorded. Distinct from a failure of the command or of the tool.
+        Err(e @ shellguard_runtime::RuntimeError::Audit(_)) => {
+            eprintln!("shellguard: {e}");
+            return Ok(ExitCode::from(65));
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    if let Some(why) = &run.audit_error {
+        eprintln!("shellguard: audit: this run was not fully recorded: {why}");
+    }
 
     if o.json {
         println!("{}", run.to_json());

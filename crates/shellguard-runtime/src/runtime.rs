@@ -111,6 +111,10 @@ pub enum RuntimeError {
     Spawn(std::io::Error),
     Enforce(shellguard_enforce::EnforceError),
     Protocol(String),
+    /// The audit log is required and could not be written, so the command was
+    /// not run. Distinct from the others because nothing went wrong with the
+    /// command: it was stopped on purpose, before it started.
+    Audit(String),
 }
 
 impl std::fmt::Display for RuntimeError {
@@ -120,6 +124,7 @@ impl std::fmt::Display for RuntimeError {
             RuntimeError::Spawn(e) => write!(f, "could not start: {e}"),
             RuntimeError::Enforce(e) => write!(f, "confinement failed: {e}"),
             RuntimeError::Protocol(m) => write!(f, "runtime protocol error: {m}"),
+            RuntimeError::Audit(m) => write!(f, "audit log unavailable: {m}"),
         }
     }
 }

@@ -128,6 +128,33 @@ void sg_engine_free(sg_engine *engine);
 /* The runtime backend in use: "local", "vz", "firecracker", "gvisor". */
 const char *sg_engine_runtime(const sg_engine *engine);
 
+/* Audit log flags for sg_engine_set_audit. */
+
+/* Also record the command's stdout and stderr (redacted). Off by default:
+ * output is where credentials most often appear. */
+#define SG_AUDIT_VERBOSE 1u
+
+/* Refuse to run a command whose audit record cannot be written. Off by
+ * default, so a full disk does not stop every command. */
+#define SG_AUDIT_REQUIRED 2u
+
+/* Attach an append-only audit log: one JSON line per judgment and execution,
+ * with secrets redacted. Returns 0, or -1 with a message in err_out.
+ *
+ * Failing to OPEN the log is always an error, whatever the flags. Unknown flag
+ * bits are rejected, so a typo cannot silently turn a requirement off.
+ *
+ * Only commands submitted through this engine appear in the log; the file's
+ * header says so. Keep the log outside the workspace. Not safe to call
+ * concurrently with any other call on the same engine. */
+int sg_engine_set_audit(sg_engine *engine, const char *path, uint32_t flags,
+                        char **err_out);
+
+/* Audit records that failed to write since the log was attached. Zero for
+ * NULL or an engine with no log. Alert on this: a best-effort log that starts
+ * failing is otherwise silent. */
+uint64_t sg_engine_audit_failures(const sg_engine *engine);
+
 /* Judge a command without running it. Returns owned JSON for sg_string_free,
  * or NULL if an argument was unusable. */
 char *sg_engine_eval_json(const sg_engine *engine, const char *command);

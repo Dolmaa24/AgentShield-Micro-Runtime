@@ -23,6 +23,7 @@ use shellguard_enforce::Profile;
 use shellguard_gate::{Decision, Gate, GateConfig, Worker};
 use shellguard_policy::Verdict;
 
+use crate::audit::AuditLog;
 use crate::json;
 use crate::local::LocalRuntime;
 use crate::rollback::{GuardOutcome, HealthCheck, RollbackPolicy, StateManager};
@@ -37,6 +38,11 @@ pub struct GuardedRun {
     pub exec: Option<ExecResult>,
     /// Absent when nothing ran, so there was nothing to guard.
     pub guard: Option<GuardOutcome>,
+    /// Why this run could not be fully recorded in the audit log, if it could
+    /// not. Never set when no audit log is configured. A best-effort log that
+    /// fails must not do so silently: a gap in the record that nobody is told
+    /// about reads as completeness.
+    pub audit_error: Option<String>,
 }
 
 impl GuardedRun {
@@ -55,6 +61,10 @@ impl GuardedRun {
         s.push_str(&self.decision.to_json(&self.command));
 
         s.push_str(&format!(",\"ran\":{}", self.ran()));
+        match &self.audit_error {
+            Some(e) => s.push_str(&format!(",\"audit_error\":{}", json::quote(e))),
+            None => s.push_str(",\"audit_error\":null"),
+        }
 
         match &self.exec {
             Some(e) => {
@@ -143,6 +153,7 @@ pub struct Engine {
     /// Off by default: `Ask` means a human should look, and a library that
     /// quietly runs those has replaced a decision with a default.
     run_on_ask: bool,
+    audit: Option<AuditLog>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -151,6 +162,7 @@ impl std::fmt::Debug for Engine {
             .field("workspace", &self.workspace)
             .field("runtime", &self.runtime.name())
             .field("run_on_ask", &self.run_on_ask)
+            .field("audit", &self.audit.as_ref().map(AuditLog::path))
             .finish()
     }
 }
@@ -169,6 +181,7 @@ impl Engine {
             workspace,
             timeout: Duration::from_secs(120),
             run_on_ask: false,
+            audit: None,
         })
     }
 
@@ -202,6 +215,26 @@ impl Engine {
         self
     }
 
+    /// Record every judgment and execution to `log`.
+    pub fn with_audit(mut self, log: AuditLog) -> Self {
+        self.audit = Some(log);
+        self
+    }
+
+    /// [`with_audit`](Self::with_audit) for an engine already behind a handle.
+    pub fn set_audit(&mut self, log: AuditLog) {
+        self.audit = Some(log);
+    }
+
+    pub fn audit(&self) -> Option<&AuditLog> {
+        self.audit.as_ref()
+    }
+
+    /// Records that failed to write since the log was attached; zero with none.
+    pub fn audit_failures(&self) -> u64 {
+        self.audit.as_ref().map_or(0, AuditLog::failures)
+    }
+
     pub fn workspace(&self) -> &Path {
         &self.workspace
     }
@@ -212,6 +245,17 @@ impl Engine {
 
     /// Judge a command without running it.
     pub fn evaluate(&self, command: &str) -> Decision {
+        let d = self.judge(command);
+        if let Some(a) = &self.audit {
+            // A judgment has no side effect to protect, so a failed record is
+            // counted (see `audit_failures`) and never blocks the answer.
+            let _ = a.evaluated(command, &d, &self.workspace);
+        }
+        d
+    }
+
+    /// The gate's answer, unrecorded — for callers that record it themselves.
+    fn judge(&self, command: &str) -> Decision {
         let mut w = Worker::new();
         self.gate.evaluate(command, &mut w)
     }
@@ -249,36 +293,94 @@ impl Engine {
     }
 
     /// The whole sequence.
+    ///
+    /// With an audit log attached the command is announced (`start`) before the
+    /// checkpoint is taken and concluded (`finish` or `error`) afterwards. If
+    /// the log is [required](crate::audit::AuditConfig::required) and the
+    /// announcement cannot be written, the command does not run.
     pub fn execute_with_rollback(&self, command: &str) -> Result<GuardedRun, RuntimeError> {
-        let decision = self.evaluate(command);
+        let decision = self.judge(command);
 
         if !self.should_run(decision.verdict) {
+            let audit_error = self
+                .audit
+                .as_ref()
+                .and_then(|a| a.refused(command, &decision, &self.workspace).err())
+                .map(|e| format!("refusal record: {e}"));
             return Ok(GuardedRun {
                 command: command.to_string(),
                 decision,
                 exec: None,
                 guard: None,
+                audit_error,
             });
         }
 
+        let mut audit_errors: Vec<String> = Vec::new();
+        let mut run_id: Option<String> = None;
+        let mut start_logged = false;
+        if let Some(a) = &self.audit {
+            let id = a.new_id();
+            match a.started(&id, command, &decision, &self.workspace, self.runtime.name()) {
+                Ok(()) => start_logged = true,
+                Err(e) if a.required() => {
+                    return Err(RuntimeError::Audit(format!(
+                        "the command was not run because it could not be recorded: {e}"
+                    )));
+                }
+                Err(e) => audit_errors.push(format!("start record: {e}")),
+            }
+            run_id = Some(id);
+        }
+
+        match self.run_guarded(command, &decision) {
+            Ok((exec, guard)) => {
+                let mut run = GuardedRun {
+                    command: command.to_string(),
+                    decision,
+                    exec: Some(exec),
+                    guard: Some(guard),
+                    audit_error: None,
+                };
+                if let (Some(a), Some(id)) = (&self.audit, &run_id) {
+                    if let Err(e) = a.finished(id, &run, &self.workspace, start_logged) {
+                        audit_errors.push(format!("finish record: {e}"));
+                    }
+                }
+                if !audit_errors.is_empty() {
+                    run.audit_error = Some(audit_errors.join("; "));
+                }
+                Ok(run)
+            }
+            Err(err) => {
+                if let (Some(a), Some(id)) = (&self.audit, &run_id) {
+                    // Already failing; a second failure has nowhere better to go
+                    // than the counter.
+                    let _ = a.errored(id, &err.to_string(), command, &self.workspace, start_logged);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Checkpoint, execute, verify. Everything after the decision to run.
+    fn run_guarded(
+        &self,
+        command: &str,
+        decision: &Decision,
+    ) -> Result<(ExecResult, GuardOutcome), RuntimeError> {
         let state = StateManager::open(&self.workspace, self.rollback.clone())
             .map_err(|e| RuntimeError::Protocol(e.to_string()))?;
         let checkpoint = state.checkpoint().map_err(|e| RuntimeError::Protocol(e.to_string()))?;
 
-        let profile = self.profile_for(&decision);
+        let profile = self.profile_for(decision);
         let payload = Payload::new(command, &self.workspace, profile).with_timeout(self.timeout);
 
         let exec = self.runtime.execute(&payload)?;
         let guard = state
             .finish(checkpoint, exec.outcome(), &self.health)
             .map_err(|e| RuntimeError::Protocol(e.to_string()))?;
-
-        Ok(GuardedRun {
-            command: command.to_string(),
-            decision,
-            exec: Some(exec),
-            guard: Some(guard),
-        })
+        Ok((exec, guard))
     }
 }
 
@@ -467,5 +569,323 @@ mod tests {
             Some("original\n"),
             "evaluate ran the command"
         );
+    }
+
+    // ------------------------------------------------------------- auditing
+
+    use crate::audit::{AuditConfig, AuditLog};
+    use crate::runtime::{Availability, Isolation};
+
+    const TOKEN: &str = "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789";
+
+    /// A log in a directory of its own, outside the workspace: a log inside it
+    /// would be an untracked file, and the checkpoint would capture it.
+    struct LogDir(PathBuf);
+
+    impl LogDir {
+        fn new(name: &str) -> LogDir {
+            let d = std::env::temp_dir().join(format!("shellguard-auditlog-{name}"));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            LogDir(d.canonicalize().unwrap())
+        }
+        fn file(&self) -> PathBuf {
+            self.0.join("audit.jsonl")
+        }
+        fn open(&self, cfg: impl FnOnce(AuditConfig) -> AuditConfig) -> AuditLog {
+            AuditLog::open(cfg(AuditConfig::new(self.file()).source("test"))).unwrap()
+        }
+        fn records(&self) -> Vec<json::Json> {
+            std::fs::read_to_string(self.file())
+                .unwrap()
+                .lines()
+                .map(|l| json::parse(l).unwrap_or_else(|e| panic!("{e}: {l}")))
+                .collect()
+        }
+        fn of_kind(&self, kind: &str) -> Vec<json::Json> {
+            self.records()
+                .into_iter()
+                .filter(|r| r.get("kind").and_then(json::Json::as_str) == Some(kind))
+                .collect()
+        }
+    }
+
+    impl Drop for LogDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn str_of<'a>(v: &'a json::Json, k: &str) -> Option<&'a str> {
+        v.get(k).and_then(json::Json::as_str)
+    }
+
+    #[derive(Debug)]
+    struct BrokenRuntime;
+
+    impl Runtime for BrokenRuntime {
+        fn name(&self) -> &'static str {
+            "broken"
+        }
+        fn availability(&self) -> Availability {
+            Availability::Ready
+        }
+        fn isolation(&self) -> Isolation {
+            Isolation::Sandbox
+        }
+        fn execute(&self, _: &Payload) -> Result<ExecResult, RuntimeError> {
+            Err(RuntimeError::Unavailable("deliberately broken for a test".into()))
+        }
+    }
+
+    #[test]
+    fn an_audited_run_leaves_a_start_and_a_finish_sharing_one_id() {
+        let r = Repo::new("audit-pair");
+        let l = LogDir::new("pair");
+        let engine = r.engine().with_audit(l.open(|c| c));
+
+        let run = engine.execute_with_rollback("echo hello").unwrap();
+        assert!(run.ran());
+        assert!(run.audit_error.is_none(), "{:?}", run.audit_error);
+
+        let (start, finish) = (&l.of_kind("start")[0], &l.of_kind("finish")[0]);
+        assert_eq!(str_of(start, "id"), str_of(finish, "id"));
+        assert!(str_of(start, "id").is_some_and(|i| !i.is_empty()));
+        assert_eq!(str_of(start, "command"), Some("echo hello"));
+        assert_eq!(str_of(start, "runtime"), Some("local"));
+        assert_eq!(finish.get("exit_code").and_then(json::Json::as_i64), Some(0));
+        assert_eq!(finish.get("rolled_back").and_then(json::Json::as_bool), Some(false));
+        // The command is stated once, on the start; the finish points at it.
+        assert!(finish.get("command").is_none());
+        // And the order on disk is the order things happened.
+        let kinds: Vec<String> =
+            l.records().iter().filter_map(|x| str_of(x, "kind").map(String::from)).collect();
+        assert_eq!(kinds, ["header", "start", "finish"]);
+    }
+
+    #[test]
+    fn a_denied_command_is_recorded_as_refused_and_never_started() {
+        let r = Repo::new("audit-refused");
+        let l = LogDir::new("refused");
+        let engine = r.engine().with_audit(l.open(|c| c));
+
+        let run = engine.execute_with_rollback("rm -rf /etc").unwrap();
+        assert!(!run.ran());
+
+        assert_eq!(l.of_kind("refused").len(), 1);
+        assert_eq!(str_of(&l.of_kind("refused")[0], "verdict"), Some("deny"));
+        assert!(l.of_kind("start").is_empty(), "a denied command was announced as running");
+        assert!(l.of_kind("finish").is_empty());
+    }
+
+    #[test]
+    fn an_escalated_command_that_is_not_run_is_still_recorded() {
+        let r = Repo::new("audit-ask");
+        let l = LogDir::new("ask");
+        let engine = r.engine().with_audit(l.open(|c| c));
+        let run = engine.execute_with_rollback("git push --force origin main").unwrap();
+        assert!(!run.ran());
+        assert_eq!(str_of(&l.of_kind("refused")[0], "verdict"), Some("ask"));
+    }
+
+    #[test]
+    fn evaluating_is_recorded_and_still_does_not_execute() {
+        let r = Repo::new("audit-eval");
+        let l = LogDir::new("eval");
+        let engine = r.engine().with_audit(l.open(|c| c));
+
+        engine.evaluate("echo written > tracked.txt");
+
+        assert_eq!(l.of_kind("evaluate").len(), 1);
+        assert!(l.of_kind("start").is_empty());
+        assert_eq!(r.read("tracked.txt").as_deref(), Some("original\n"));
+    }
+
+    #[test]
+    fn a_rollback_and_its_reasons_are_in_the_record() {
+        let r = Repo::new("audit-rollback");
+        let l = LogDir::new("rollback");
+        let engine = r
+            .engine()
+            .with_rollback_policy(RollbackPolicy {
+                protected: vec![PathBuf::from("tracked.txt")],
+                ..Default::default()
+            })
+            .with_audit(l.open(|c| c));
+
+        let run = engine.execute_with_rollback("echo tampered > tracked.txt").unwrap();
+        assert!(run.rolled_back());
+
+        let f = &l.of_kind("finish")[0];
+        assert_eq!(f.get("rolled_back").and_then(json::Json::as_bool), Some(true));
+        let reasons = f.get("rollback_reasons").and_then(json::Json::as_array).unwrap();
+        assert!(reasons.iter().any(|x| x.as_str().is_some_and(|s| s.contains("tracked.txt"))));
+        let changed = f.get("changed_protected").and_then(json::Json::as_array).unwrap();
+        assert_eq!(changed.len(), 1);
+    }
+
+    #[test]
+    fn output_is_not_recorded_unless_asked_for() {
+        let r = Repo::new("audit-quiet");
+        let l = LogDir::new("quiet");
+        // The output is assembled by printf, so "zxyyqv" exists only in stdout
+        // and never in the command text that is recorded.
+        let run = r
+            .engine()
+            .with_audit(l.open(|c| c))
+            .execute_with_rollback("printf 'zx%sqv' yy")
+            .unwrap();
+        let exec = run.exec.as_ref().unwrap_or_else(|| {
+            panic!(
+                "did not run: verdict={:?} incomplete={:?} elapsed={:?}",
+                run.decision.verdict, run.decision.incomplete, run.decision.elapsed
+            )
+        });
+        let stdout = String::from_utf8_lossy(&exec.stdout).to_string();
+        assert_eq!(stdout, "zxyyqv", "the command did not produce the marker output");
+        let raw = std::fs::read_to_string(l.file()).unwrap();
+        assert!(!raw.contains("zxyyqv"), "stdout was recorded by default: {raw}");
+        assert!(l.of_kind("finish")[0].get("stdout").is_none());
+    }
+
+    #[test]
+    fn verbose_output_is_recorded_and_redacted() {
+        let r = Repo::new("audit-verbose");
+        let l = LogDir::new("verbose");
+        let engine = r.engine().with_audit(l.open(|c| c.verbose(true)));
+        // Both the marker and the token are assembled by printf, so neither
+        // appears in the command text — only stdout can be the source of them.
+        engine.execute_with_rollback(&format!("printf 'zx%sqv %s' yy {}", TOKEN)).unwrap();
+
+        let raw = std::fs::read_to_string(l.file()).unwrap();
+        assert!(!raw.contains(TOKEN), "a credential in stdout reached the audit file");
+        let out = str_of(&l.of_kind("finish")[0], "stdout").unwrap().to_string();
+        assert!(out.contains("zxyyqv"), "{out}");
+        assert!(out.contains("[REDACTED]"), "{out}");
+    }
+
+    #[test]
+    fn a_runtime_failure_is_recorded_as_an_error_against_the_same_id() {
+        let r = Repo::new("audit-error");
+        let l = LogDir::new("error");
+        let engine = r.engine().with_runtime(Box::new(BrokenRuntime)).with_audit(l.open(|c| c));
+
+        let err = engine.execute_with_rollback("echo hi").unwrap_err();
+        assert!(matches!(err, RuntimeError::Unavailable(_)));
+
+        let (start, error) = (&l.of_kind("start")[0], &l.of_kind("error")[0]);
+        assert_eq!(str_of(start, "id"), str_of(error, "id"));
+        assert!(str_of(error, "error").unwrap().contains("deliberately broken"));
+        assert!(l.of_kind("finish").is_empty());
+    }
+
+    #[test]
+    fn a_required_log_that_cannot_be_written_stops_the_command() {
+        let r = Repo::new("audit-required");
+        let l = LogDir::new("required");
+        let engine = r.engine().with_audit(l.open(|c| c.required(true)));
+
+        // The log's directory disappears after it was opened.
+        std::fs::remove_dir_all(&l.0).unwrap();
+        let err = engine.execute_with_rollback("echo ran > marker.txt").unwrap_err();
+
+        assert!(matches!(err, RuntimeError::Audit(_)), "{err:?}");
+        assert!(err.to_string().contains("not run"), "{err}");
+        assert!(
+            r.read("marker.txt").is_none(),
+            "the command ran although it could not be recorded"
+        );
+        assert!(engine.audit_failures() >= 1);
+    }
+
+    #[test]
+    fn a_best_effort_log_that_cannot_be_written_reports_it_and_still_runs() {
+        let r = Repo::new("audit-besteffort");
+        let l = LogDir::new("besteffort");
+        let engine = r.engine().with_audit(l.open(|c| c));
+
+        std::fs::remove_dir_all(&l.0).unwrap();
+        let run = engine.execute_with_rollback("echo ran > marker.txt").unwrap();
+
+        assert!(run.ran());
+        assert_eq!(r.read("marker.txt").as_deref(), Some("ran\n"));
+        let why = run.audit_error.as_deref().expect("a failed record must be reported");
+        assert!(why.contains("start record") && why.contains("finish record"), "{why}");
+        assert!(engine.audit_failures() >= 2);
+
+        // And it reaches the JSON callers actually read.
+        let v = json::parse(&run.to_json()).unwrap();
+        assert!(v.get("audit_error").and_then(json::Json::as_str).is_some());
+    }
+
+    #[test]
+    fn with_no_audit_log_there_is_no_audit_error() {
+        let r = Repo::new("audit-none");
+        let run = r.engine().execute_with_rollback("echo hi").unwrap();
+        assert!(run.audit_error.is_none());
+        let v = json::parse(&run.to_json()).unwrap();
+        assert_eq!(v.get("audit_error"), Some(&json::Json::Null));
+        assert_eq!(r.engine().audit_failures(), 0);
+    }
+
+    #[test]
+    fn the_log_file_is_not_swept_into_the_checkpoint_or_rolled_back() {
+        // A log kept *inside* the workspace is an untracked file, and a
+        // rollback that restored it would erase the record of the rollback.
+        // Documented behaviour is "keep the log outside the workspace"; this
+        // pins that a log outside is untouched by a rollback.
+        let r = Repo::new("audit-survives");
+        let l = LogDir::new("survives");
+        let engine = r
+            .engine()
+            .with_rollback_policy(RollbackPolicy {
+                protected: vec![PathBuf::from("tracked.txt")],
+                ..Default::default()
+            })
+            .with_audit(l.open(|c| c));
+        let run = engine.execute_with_rollback("echo tampered > tracked.txt").unwrap();
+        assert!(run.rolled_back());
+        assert_eq!(l.of_kind("finish").len(), 1, "the record of the rollback did not survive it");
+    }
+
+    #[test]
+    fn a_command_cannot_tamper_with_the_log_it_is_recorded_in() {
+        // The integrity of an audit log rests on the writer being outside the
+        // thing it records, and it is held by two independent layers. Both are
+        // exercised, because a test that only lets the gate refuse the command
+        // says nothing about the kernel:
+        //
+        //  * by default the gate escalates a write outside the workspace, so
+        //    the command never runs;
+        //  * with `run_on_ask` the command is forced past the gate, and it is
+        //    the kernel sandbox alone that must stop it.
+        //
+        // "tamxpered" is assembled by printf, so it appears only in what the
+        // command would write, never in the command text the log records.
+        for forced_past_the_gate in [false, true] {
+            let name = format!("audit-tamper-{forced_past_the_gate}");
+            let r = Repo::new(&name);
+            let l = LogDir::new(&name);
+            let engine = r.engine().run_on_ask(forced_past_the_gate).with_audit(l.open(|c| c));
+
+            let cmd = format!("printf 'tam%spered' x >> {}", l.file().display());
+            let run = engine.execute_with_rollback(&cmd).unwrap();
+
+            let after = std::fs::read_to_string(l.file()).unwrap();
+            assert!(
+                !after.contains("tamxpered"),
+                "forced={forced_past_the_gate}: a command wrote into its own audit log"
+            );
+            for line in after.lines() {
+                assert!(json::parse(line).is_ok(), "corrupt line: {line}");
+            }
+
+            if forced_past_the_gate {
+                let e = run.exec.as_ref().expect("run_on_ask should have let it run");
+                assert!(!e.ok(), "the write into the log reported success");
+            } else {
+                assert!(!run.ran(), "the gate should have stopped a write outside the workspace");
+            }
+        }
     }
 }

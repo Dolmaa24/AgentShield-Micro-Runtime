@@ -168,6 +168,43 @@ files, so a naive implementation would have lost it permanently — nothing in g
 ever recorded its contents. They are hashed into the object database separately
 for exactly this case. See [DESIGN.md § 7](DESIGN.md#7-rollback-checkpoint-and-restore).
 
+## Audit log
+
+Add `--audit FILE` and every judgment and execution is appended to it, one JSON
+line each. A checkpoint answers "can I get my files back"; the log answers "what
+was the agent trying to do, and did the gate catch it" — a rolled-back command
+leaves nothing else behind.
+
+```
+$ shellguard run -w /tmp/work --rollback-on-failure --audit ~/audit/agent.jsonl 'rm notes.md; exit 1'
+workspace reverted: the command exited 1
+
+$ cat ~/audit/agent.jsonl        # trimmed; each record also carries time, pid, ids and timings
+{"kind":"header","schema":1,"tool":"shellguard","verbose":false,"required":false,"coverage":"records only commands submitted to an engine holding this log; …"}
+{"kind":"start","runtime":"local","command":"rm notes.md; exit 1","verdict":"confine","complete":true,"capabilities":[],"findings":[]}
+{"kind":"finish","exit_code":1,"timed_out":false,"rolled_back":true,"rollback_reasons":["the command exited 1"],"changed_protected":[]}
+{"kind":"refused","command":"rm -rf /etc","ran":false,"verdict":"deny","capabilities":["fs.delete"],"findings":[{"rule":"destructive.rm-recursive-outside","verdict":"deny"}]}
+```
+
+- **Two records per execution.** `start` is written before the checkpoint,
+  `finish` after, sharing an `id`. A `start` with no `finish` is what a crash
+  mid-command looks like.
+- **Secrets are redacted; output is not recorded.** Commands pass through a
+  redactor (tokens, `Authorization` headers, `key=value` pairs, URL passwords,
+  private-key blocks). That is best-effort, which is why stdout and stderr are
+  off unless you pass `--audit-verbose`.
+- **The file is mode `0600`**, and a log that is group- or world-writable is
+  refused. Keep it **outside the workspace**: a log inside it would be captured
+  by the checkpoint and restored by a rollback.
+- **It rotates** at 8 MiB (`--audit-max-bytes`, `--audit-keep`), safely across
+  concurrent processes.
+- **Failing to write is never silent.** By default the command still runs and
+  the run reports `audit_error`; with `--audit-required` a command that cannot
+  be recorded is not run (exit 65). `$SHELLGUARD_AUDIT` sets the path once.
+
+It records only what goes through it — a quiet log is not a quiet agent, and
+each file's header says so. Details and limits: [DESIGN.md § 14](DESIGN.md#14-the-audit-log).
+
 ## Python
 
 ```python
@@ -181,6 +218,10 @@ with SandboxEngine(workspace="/srv/agent/work", rollback_on_failure=True) as eng
     if result.rolled_back:
         print("reverted:", result.rollback_reasons)
 ```
+
+Pass `audit_log="/var/log/agent/audit.jsonl"` to record everything (see [Audit
+log](#audit-log)); `result.audit_error` and `engine.audit_failures` say if the
+record has gaps.
 
 `ctypes`, no build step. A refused command returns normally with `ran=False`
 rather than raising — refusing is the library working, and a binding that raised
