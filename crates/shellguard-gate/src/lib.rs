@@ -273,6 +273,9 @@ mod tests {
         // reads is a constant that drifts.
         assert_eq!(GateConfig::default().deadline, DEFAULT_DEADLINE);
         assert_eq!(GateConfig::from_env("/tmp").deadline, DEFAULT_DEADLINE);
+        // Commands start in the workspace, not wherever the embedding process
+        // is standing.
+        assert_eq!(GateConfig::from_env("/srv/ws").cwd, std::path::PathBuf::from("/srv/ws"));
     }
 
     #[test]

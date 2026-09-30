@@ -404,22 +404,32 @@ end
 # git config keys whose values name a program. Setting one turns an ordinary
 # later `git` invocation into arbitrary execution, which makes this a delayed
 # shell escape rather than a configuration change.
+#
+# Keys are matched without regard to case because git reads them that way:
+# `git config CORE.PAGER x` sets `core.pager`, and was `confine` while the
+# lower-case spelling was `ask`. `alias.` is here because an alias can run a
+# shell command (`!cmd`) or rename a destructive one so no rule sees it
+# (`alias.x = reset --hard`, then `git x`).
 rule vcs.config-executes ask
-  reason this git config key names a program that later git commands will run
+  reason this git config key names a program that later git commands will run, or defines an alias
   program git
   subcommand config
+  arg-contains-nocase core.pager pager. core.editor sequence.editor core.sshcommand ssh.program core.gitproxy core.fsmonitor core.hookspath core.askpass diff.external .textconv .command .driver .cmd credential. gpg. protocol.ext uploadpack receivepack filter. web.browser include.path includeif. alias.
+  cap shell.escape
+end
+
+# The same keys, set for one command only. `git -c core.pager='sh -c ...' log`
+# runs the pager without writing any config, and `git -c alias.x='!cmd' x` runs
+# a shell command — measured. `-c` takes its value as the next word, so the
+# `-c` and the key are separate arguments.
+rule vcs.config-executes-inline ask
+  reason sets, for one command, a git config key that runs a program or defines an alias
+  program git
   any
-    arg-contains core.pager
-    arg-contains core.editor
-    arg-contains core.sshCommand
-    arg-contains core.fsmonitor
-    arg-contains diff.external
-    arg-contains credential.helper
-    arg-contains protocol.ext
-    arg-contains uploadpack
-    arg-contains receivepack
-    arg-prefix filter.
+    arg-eq -c
+    arg-prefix --config-env
   end-any
+  arg-contains-nocase core.pager pager. core.editor sequence.editor core.sshcommand ssh.program core.gitproxy core.fsmonitor core.hookspath core.askpass diff.external .textconv .command .driver .cmd credential. gpg. protocol.ext uploadpack receivepack filter. web.browser include.path includeif. alias.
   cap shell.escape
 end
 
@@ -558,12 +568,18 @@ end
 # that file, creating or overwriting it, with no shell redirect for the write
 # rules to see. Git rejects abbreviations of it, so the prefix is complete.
 # Without this, `git log --output=$HOME/.bashrc` was `allow`.
+#
+# And only this workspace's repository: `git -C /elsewhere status`,
+# `--git-dir`, `--work-tree`, `git diff --no-index /etc/passwd x` and
+# `git blame --contents /etc/passwd f` all read outside it, and a path that
+# points outside the workspace takes the rule out of play like any other.
 rule safe.vcs-inspection allow
   reason read-only version control inspection
   program git
   subcommand status log diff show remote describe rev-parse blame shortlog
   not arg-eq add set-url remove rm rename prune update set-head set-branches
-  not arg-prefix --output
+  not arg-prefix --output --git-dir --work-tree
+  not path-outside-workspace
   not write-redirect
   cap fs.read
 end

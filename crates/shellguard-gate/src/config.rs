@@ -62,10 +62,18 @@ impl Default for GateConfig {
 
 impl GateConfig {
     /// Build a config from the current process environment, with `workspace` as
-    /// the agent's writable root.
+    /// the agent's writable root — and as the directory its commands start in.
+    ///
+    /// The shell's directory defaults to the workspace, not to wherever the
+    /// process that embeds the gate happens to be standing. Every caller in this
+    /// repository was setting it to the workspace by hand straight afterwards;
+    /// the one that did not — the C API — resolved `./build` against its host
+    /// process and judged `git status` from outside the workspace. A harness
+    /// whose commands start somewhere else says so with
+    /// [`with_cwd`](Self::with_cwd).
     pub fn from_env(workspace: impl Into<PathBuf>) -> Self {
         let workspace = workspace.into();
-        let cwd = std::env::current_dir().unwrap_or_else(|_| workspace.clone());
+        let cwd = workspace.clone();
         GateConfig {
             workspace,
             cwd,

@@ -312,3 +312,121 @@ fn git_output_flag_writes_a_file_so_it_is_not_read_only() {
     assert_eq!(gate.evaluate("git diff --stat", &mut w).verdict, Verdict::Allow);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Global options go before git's subcommand, and some take the next word as
+/// their value: `git -C dir reset --hard`. The gate once took that value for the
+/// subcommand, so every rule about `reset`, `clean`, `push --force`, `branch -D`
+/// or `config core.pager` looked past it and the verdict fell to `confine`.
+///
+/// The property, over every line of git_refs.txt and the destructive commands
+/// elsewhere in the policy: putting a global option in front never lowers the
+/// verdict.
+#[test]
+fn a_global_option_never_lowers_a_git_verdict() {
+    let work = std::env::temp_dir().join("shellguard-git-globals/ws");
+    std::fs::create_dir_all(&work).unwrap();
+    let gate = gate_for(&work.canonicalize().unwrap());
+    let mut w = Worker::new();
+
+    let mut commands: Vec<String> = cases().into_iter().map(|c| c.cmd).collect();
+    commands.extend(
+        [
+            "git reset --hard HEAD~1",
+            "git clean -fdx",
+            "git checkout -- .",
+            "git push --force origin main",
+            "git rebase -i main",
+            "git config core.pager less",
+            "git config alias.x '!rm -rf ~'",
+        ]
+        .map(String::from),
+    );
+    let prefixes = [
+        "-C .",
+        "-C /tmp",
+        "-c color.ui=never",
+        "--git-dir .git",
+        "--git-dir=.git",
+        "--work-tree .",
+        "--namespace ns",
+        "--no-pager",
+        "-P",
+    ];
+
+    let mut lowered = Vec::new();
+    for cmd in &commands {
+        let rest = cmd.strip_prefix("git ").expect("a git command");
+        let plain = gate.evaluate(cmd, &mut w).verdict;
+        for p in prefixes {
+            let with = format!("git {p} {rest}");
+            let v = gate.evaluate(&with, &mut w).verdict;
+            if v < plain {
+                lowered.push(format!(
+                    "  {with:?}: {} (without the option: {})",
+                    v.as_str(),
+                    plain.as_str()
+                ));
+            }
+        }
+    }
+    assert!(lowered.is_empty(), "a global option lowered the verdict:\n{}", lowered.join("\n"));
+}
+
+/// The `-c` rule, grounded: these really do what the rule says they do, on the
+/// git installed here.
+#[test]
+fn inline_config_and_case_folded_keys_do_what_the_rules_say() {
+    if !git_available() {
+        eprintln!("git is not installed: skipping");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("shellguard-git-inline-{}", std::process::id()));
+    let base = root.join("base");
+    let work = root.join("work");
+    build_fixture(&base);
+    std::fs::create_dir_all(&work).unwrap();
+    let work = work.canonicalize().unwrap();
+    let gate = gate_for(&work);
+    let mut w = Worker::new();
+    let sh = |cmd: &str| {
+        scratch("sh", &work)
+            .arg("-c")
+            .arg(cmd)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("sh")
+    };
+
+    // An alias set for one command runs a shell command.
+    copy_dir(&base, &work);
+    let cmd = "git -c alias.x='!touch pwned' x";
+    sh(cmd);
+    assert!(work.join("pwned").exists(), "the alias did not run");
+    assert_eq!(gate.evaluate(cmd, &mut w).verdict, Verdict::Ask);
+
+    // ... and can rename a destructive command.
+    copy_dir(&base, &work);
+    std::fs::write(work.join("f.txt"), "uncommitted work\n").unwrap();
+    let cmd = "git -c alias.x='reset --hard' x";
+    sh(cmd);
+    assert_eq!(std::fs::read_to_string(work.join("f.txt")).unwrap(), "commit 3\n");
+    assert_eq!(gate.evaluate(cmd, &mut w).verdict, Verdict::Ask);
+
+    // `-C` in front of a destructive command still runs it.
+    copy_dir(&base, &work);
+    std::fs::write(work.join("f.txt"), "uncommitted work\n").unwrap();
+    let cmd = "git -C . reset --hard";
+    sh(cmd);
+    assert_eq!(std::fs::read_to_string(work.join("f.txt")).unwrap(), "commit 3\n");
+    assert_eq!(gate.evaluate(cmd, &mut w).verdict, Verdict::Ask);
+
+    // Config keys are case-insensitive.
+    copy_dir(&base, &work);
+    let cmd = "git config CORE.PAGER 'echo paged'";
+    sh(cmd);
+    let got = git(&work, &["config", "--get", "core.pager"]);
+    assert_eq!(got.trim(), "echo paged");
+    assert_eq!(gate.evaluate(cmd, &mut w).verdict, Verdict::Ask);
+
+    let _ = std::fs::remove_dir_all(&root);
+}

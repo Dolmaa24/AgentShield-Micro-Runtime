@@ -586,10 +586,18 @@ impl<'a> Collector<'a> {
         }
 
         let bare_names_are_paths = !self.pwd_is_inside();
+        let globals = global_value_options(cmd.program.as_deref().unwrap_or(""));
+        let mut is_value = false;
         for w in s.args() {
             let arg = self.word_to_arg(w, bare_names_are_paths);
-            if let Some(lit) = &arg.literal {
-                if is_short_flag_bundle(lit) {
+            if is_value {
+                // The value of a global option — the `dir` in `git -C dir` — is
+                // neither the subcommand nor a flag.
+                is_value = false;
+            } else if let Some(lit) = &arg.literal {
+                if cmd.subcommand.is_none() && globals.contains(&lit.as_str()) {
+                    is_value = true;
+                } else if is_short_flag_bundle(lit) {
                     cmd.short_flags.push_str(&lit[1..]);
                 } else if cmd.subcommand.is_none() && !lit.starts_with('-') {
                     cmd.subcommand = Some(lit.clone());
@@ -711,6 +719,34 @@ impl<'a> Collector<'a> {
     }
 }
 
+/// Options a program takes before its subcommand that consume the next word.
+///
+/// Without this the subcommand is the option's *value*: `git -C dir reset
+/// --hard` had the subcommand `dir`, so every rule about `reset`, `clean`,
+/// `push --force` or `config core.pager` looked straight past it — and so did
+/// `git -c x=y`. Only programs whose rules key on a subcommand need an entry,
+/// and only options that take a separate word; `--opt=value` is one word.
+fn global_value_options(program: &str) -> &'static [&'static str] {
+    match program {
+        "git" => &[
+            "-C",
+            "-c",
+            "--git-dir",
+            "--work-tree",
+            "--namespace",
+            "--super-prefix",
+            "--config-env",
+            "--attr-source",
+        ],
+        "npm" => &["--prefix", "-w", "--workspace"],
+        "yarn" => &["--cwd"],
+        "pnpm" => &["-C", "--dir", "-F", "--filter"],
+        "go" => &["-C"],
+        "cargo" => &["-C", "-Z", "--config", "--color"],
+        _ => &[],
+    }
+}
+
 /// Where a path argument lands, from the directories the shell may be in.
 #[derive(Clone, Copy, Debug, Default)]
 struct Placed {
@@ -767,9 +803,36 @@ mod tests {
     }
 
     #[test]
+    fn a_global_option_s_value_is_not_the_subcommand() {
+        for (src, sub) in [
+            ("git -C /elsewhere reset --hard", "reset"),
+            ("git -c core.pager=less log", "log"),
+            ("git --git-dir .git --work-tree . clean -fdx", "clean"),
+            ("git --config-env core.pager=P log", "log"),
+            ("git --git-dir=.git status", "status"),
+            ("npm --prefix /opt install x", "install"),
+            ("go -C sub build", "build"),
+        ] {
+            let cmds = collect_all(src, &cfg());
+            assert_eq!(cmds[0].subcommand.as_deref(), Some(sub), "{src}");
+        }
+        // `-C` before the subcommand is git's directory, not `branch -C`.
+        let cmds = collect_all("git -C sub branch -a", &cfg());
+        assert_eq!(cmds[0].short_flags, "a");
+        // After the subcommand, the same word is the subcommand's own flag.
+        let cmds = collect_all("git branch -C a b", &cfg());
+        assert_eq!(cmds[0].short_flags, "C");
+    }
+
+    #[test]
     fn subcommand_is_the_first_non_flag() {
+        // This used to assert `x=y` — the value of git's `-c` — as the
+        // subcommand, which is how `git -c x=y reset --hard` slipped past every
+        // rule about `reset`. For a program with no known global options the
+        // first non-flag literal is still the subcommand.
         let cmds = collect_all("git -c x=y reset --hard", &cfg());
-        // `-c` is a short-flag bundle, `x=y` is the first non-flag literal.
+        assert_eq!(cmds[0].subcommand.as_deref(), Some("reset"));
+        let cmds = collect_all("tool -c x=y reset", &cfg());
         assert_eq!(cmds[0].subcommand.as_deref(), Some("x=y"));
         let cmds = collect_all("git reset --hard", &cfg());
         assert_eq!(cmds[0].subcommand.as_deref(), Some("reset"));

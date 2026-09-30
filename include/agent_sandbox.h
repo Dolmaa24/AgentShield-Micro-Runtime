@@ -46,9 +46,11 @@ typedef struct sg_decision sg_decision;
 
 /* Create a gate.
  *
- * workspace   directory the agent may write to; must not be NULL
+ * workspace   directory the agent may write to, and where its commands
+ *             start: relative paths are resolved against it; must not be NULL
  * policy_path a policy file, or NULL for the built-in ruleset
- * deadline_ms evaluation budget; 0 means the default of 10 ms
+ * deadline_ms evaluation deadline, after which the gate fails closed; 0 means
+ *             the default of 100 ms
  * err_out     on failure, receives an owned message for sg_string_free
  *
  * Returns NULL on failure. */

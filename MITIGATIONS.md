@@ -372,6 +372,13 @@ was `allow`; `git remote add` was allowed as inspection; and Landlock denied
 |---|---|
 | Linux: "no network" is TCP only; UDP and Unix sockets are open (read from code, never run) | the fix is a seccomp filter on `socket()`, a user+network namespace, or routing risky commands to gVisor. The first cannot be tested off-Linux; the second fails on hardened kernels |
 
+**Closed since:** git's global options hid the subcommand from every git rule —
+`git -C dir reset --hard` and `git -c x=y clean -fdx` were `confine` — and `git -c`
+with a program-naming key, or any alias, ran a program with no rule seeing it.
+Both ask now; config keys are matched case-insensitively, as git reads them; and
+read-only git inspection is limited to the workspace's repository. Found on the
+way: the C API resolved relative paths against its host process's directory.
+
 **Closed since:** the gate follows `cd`. `cd / && rm -rf *` was `confine`,
 judged as if it ran in the workspace; it is `deny`. The gate tracks the set of
 directories the shell may be in — through `&&`, `||`, `if`, subshells, pipelines,

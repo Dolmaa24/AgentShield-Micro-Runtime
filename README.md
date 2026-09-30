@@ -343,7 +343,7 @@ crates/shellguard-enforce   Seatbelt / Landlock + seccomp
 crates/shellguard-ffi       C ABI
 crates/shellguard-cli       eval, corpus, bench, profile
 policies/default.policy     the built-in ruleset
-tests/corpus.txt            212 commands with expected verdicts
+tests/corpus.txt            230 commands with expected verdicts
 tests/git_refs.txt          98 git branch/tag commands, run against a real repo
 tests/exfiltration.txt      what stops each command from sending data out
 ```

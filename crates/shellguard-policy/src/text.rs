@@ -256,6 +256,12 @@ fn predicate(head: &str, args: &[String]) -> Result<Pred, String> {
             need("at least one value")?;
             Pred::ArgContains(vals())
         }
+        "arg-contains-nocase" => {
+            need("at least one value")?;
+            // Stored lowercased, so a value written `core.sshCommand` still
+            // matches — the reader should not have to know to lowercase it.
+            Pred::ArgContainsNoCase(args.iter().map(|a| a.to_ascii_lowercase()).collect())
+        }
         "arg-suffix" => {
             need("at least one value")?;
             Pred::ArgSuffix(vals())

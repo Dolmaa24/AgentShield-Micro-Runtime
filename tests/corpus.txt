@@ -309,3 +309,30 @@ confine	cd /tmp && cd - && rm -rf build
 confine	pushd /tmp && popd && rm -rf build
 confine	bash -c 'cd /'; rm -rf build
 allow	cd src && ls
+
+# ---------------------------------------------------------------------------
+# git's global options go before the subcommand, and some take a value. The
+# gate once read `git -C dir reset --hard` as the subcommand `dir`, and every
+# git rule looked past it. Each `ask` below was `confine`, and the last `allow`.
+# ---------------------------------------------------------------------------
+ask	git -C . reset --hard
+ask	git -c x=y reset --hard
+ask	git --work-tree . checkout -- .
+ask	git -C . clean -fdx
+ask	git -C . push --force origin main
+ask	git -C . branch -D main
+# Config keys are case-insensitive, and `-c` sets one for a single command. An
+# alias can run a shell command, or rename a destructive one.
+ask	git config CORE.PAGER 'sh -c evil'
+ask	git config core.sshcommand evil
+ask	git config alias.x '!rm -rf ~'
+ask	git -c core.pager='sh -c evil' log
+ask	git -c alias.x='!rm -rf ~' x
+ask	git -c alias.x='reset --hard' x
+ask	git --config-env=core.pager=EVIL log
+allow	git -c color.ui=never log
+# Read-only inspection of this workspace's repository, not any other.
+confine	git -C /tmp status
+confine	git --git-dir=/tmp/other/.git log
+confine	git diff --no-index /etc/passwd notes.txt
+allow	git -C src status

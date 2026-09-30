@@ -274,6 +274,13 @@ pub enum Pred {
     ArgPrefix(Vec<String>),
     /// Some argument contains one of these.
     ArgContains(Vec<String>),
+    /// Some argument contains one of these, ignoring ASCII case.
+    ///
+    /// For names the program itself reads without regard to case: git config
+    /// keys are case-insensitive, so `git config CORE.PAGER x` sets `core.pager`,
+    /// and a case-sensitive rule about `core.pager` never sees it. Values are
+    /// compared lowercased; write them in lower case.
+    ArgContainsNoCase(Vec<String>),
     /// Some argument ends with one of these.
     ArgSuffix(Vec<String>),
     /// The command text contains one of these. Indexed by the prefilter.
@@ -348,6 +355,10 @@ impl Pred {
             Pred::ArgContains(vs) => {
                 f.args.iter().any(|a| vs.iter().any(|v| a.text().contains(v.as_str())))
             }
+            Pred::ArgContainsNoCase(vs) => f.args.iter().any(|a| {
+                let text = a.text().to_ascii_lowercase();
+                vs.iter().any(|v| text.contains(v.as_str()))
+            }),
             Pred::ArgSuffix(vs) => f.args.iter().any(|a| match a.literal {
                 Some(l) => vs.iter().any(|v| l.ends_with(v.as_str())),
                 None => false,
@@ -397,6 +408,8 @@ impl Pred {
     /// in the command text. `Not` contributes nothing, because a negated
     /// predicate matches precisely when its needle is absent — indexing it
     /// would drop the rule from consideration exactly when it should fire.
+    /// Nor does `ArgContainsNoCase`: the prefilter matches exact bytes, and
+    /// `CORE.PAGER` does not contain `core.pager`.
     fn needles(&self, out: &mut Vec<String>) {
         match self {
             Pred::TextContains(vs)
@@ -645,6 +658,18 @@ mod tests {
         // ... so a long name can never be mistaken for a short flag.
         let p = allowed(&["--list"]);
         assert!(!git_matches(&p, "branch", &[arg("-l")]));
+    }
+
+    #[test]
+    fn nocase_matching_ignores_case_and_the_prefilter_does_not_index_it() {
+        let args = [arg("CORE.PAGER"), arg("less")];
+        let f = CommandFacts { subcommand: Some("config"), ..facts("git", &args, "") };
+        assert!(Pred::ArgContainsNoCase(vec!["core.pager".into()]).matches(&f));
+        assert!(!Pred::ArgContains(vec!["core.pager".into()]).matches(&f));
+        assert!(!Pred::ArgContainsNoCase(vec!["core.editor".into()]).matches(&f));
+        let mut out = Vec::new();
+        Pred::ArgContainsNoCase(vec!["core.pager".into()]).needles(&mut out);
+        assert!(out.is_empty(), "a case-insensitive predicate must not become a byte needle");
     }
 
     #[test]

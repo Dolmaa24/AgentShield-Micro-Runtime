@@ -561,6 +561,26 @@ mod tests {
         }
     }
 
+    /// The C API once resolved relative paths against the *host process's*
+    /// directory: this test process runs from the crate directory, outside the
+    /// workspace, so `./build` looked like a delete outside it.
+    #[test]
+    fn relative_paths_are_judged_from_the_workspace_not_the_host_process() {
+        let f = Fixture::new();
+        assert_ne!(
+            std::env::current_dir().unwrap().canonicalize().unwrap(),
+            std::env::temp_dir().join("shellguard-ffi-tests/ws").canonicalize().unwrap(),
+            "the test needs the process to stand outside the workspace"
+        );
+        for (cmd, want) in [("rm -rf ./build", 1), ("git status", 0), ("rm -rf ../../x", 3)] {
+            let d = f.eval(cmd);
+            unsafe {
+                assert_eq!(sg_decision_verdict(d), want, "{cmd}");
+                sg_decision_free(d);
+            }
+        }
+    }
+
     #[test]
     fn a_worker_can_be_reused_across_many_evaluations() {
         let f = Fixture::new();
@@ -1370,7 +1390,7 @@ mod reload_tests {
                     let mut seen = (0, 0);
                     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                         let d = eval(e, "echo hi");
-                        // A decision that ran out of its 10 ms budget fails closed
+                        // A decision that ran out of its deadline fails closed
                         // whatever the rules say. That is a latency event under
                         // this test's deliberate CPU contention, not a policy
                         // mix-up, and counting it as one made this test flaky.

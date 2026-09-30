@@ -795,10 +795,30 @@ judgment, mirrored on `reset --hard`; it is one rule each in `default.policy`.
 for the write rules to see, and was `allow`. It is now excluded from the read-only
 rule; `git log --output=$HOME/.bashrc` is `confine`.
 
-*Not fixed:* the read-only rule still allows `git diff --no-index a b` and
-`git blame --contents <file>`, which read paths outside the repository, and
-`--ext-diff`/`--textconv`, which run programs named in git configuration. The last is
-covered only in that setting such a configuration is `ask` (`vcs.config-executes`).
+*git's global options hid the subcommand.* `git -C dir reset --hard` was read as
+the subcommand `dir`, because the subcommand was "the first word that is not a
+flag" and `-C` takes the next word as its value. Every git rule keyed on a
+subcommand looked past it: `reset --hard`, `clean -fdx`, `push --force`, `branch -D`,
+`rebase -i`, `config core.pager` all fell to `confine` behind `-C`, `-c` or
+`--work-tree`. The gate now knows which global options take a value (git's, and the
+package managers' `--prefix`/`--cwd`/`-C`), and a test holds the property that
+putting any of them in front of any command in `git_refs.txt` never lowers its
+verdict.
+
+*And `-c` is a way to run a program.* `git -c core.pager='sh -c …' log` runs the
+pager without writing any config, and `git -c alias.x='!cmd' x` runs a shell
+command — both measured. An alias can also rename a destructive command so no rule
+sees it: `git -c alias.x='reset --hard' x` resets. Inline config with a key that
+names a program, or any alias, now asks, as `git config` with the same keys does.
+Keys are matched without regard to case, through a new `arg-contains-nocase`
+predicate, because git reads them that way: `git config CORE.PAGER x` sets
+`core.pager`, and was `confine` while the lower-case spelling was `ask`.
+
+*Read-only means this repository.* `git -C /elsewhere status`, `--git-dir`,
+`--work-tree`, `git diff --no-index /etc/passwd x` and `git blame --contents <file>`
+read outside the workspace, and the read-only rule no longer allows a path that
+points outside it. What remains is `--ext-diff`/`--textconv`, which run programs
+named in configuration — covered only in that setting such a configuration asks.
 
 **The gate follows `cd` now (§ 17), with stated edges.** It used to resolve every
 relative path against one fixed directory, so `cd / && rm -rf *` was judged like
@@ -878,6 +898,9 @@ tests that found them.
 | two mutants of the `cd` model survived: every script followed an `if` with `;`, which merges both outcomes, and nothing reset the state after an alias | mutation testing |
 | following `cd` first cost 1.7 µs a command, mostly re-deciding per evaluation where the shell *starts* | an A/B benchmark with only the gate's source swapped |
 | `shellguard profile` rebuilt the profile on its own, skipped the step that makes the workspace writable for `confine`, and left out the per-run scratch directory — it showed a read-only workspace for commands `run` let write | using its output as the baseline for the Mach-service experiments (§ 6.1): tools that `run` ran fine failed under the printed profile |
+| `git -C dir reset --hard` and `git -c x=y clean -fdx` were `confine`: the value of a global option was taken for the subcommand, and a unit test asserted that as correct | trying `git -C` while scoping the program-level `-C` options |
+| `git config CORE.PAGER x` sets `core.pager`, and was `confine` while the lower-case spelling was `ask` | reading git's documentation on key names after the `-C` finding, then running it |
+| the C API resolved relative paths against the *host process's* directory, not the workspace; every other caller set it by hand | the FFI tests failing once the read-only git rule began refusing paths outside the workspace |
 | git accepts unambiguous abbreviations of long options: `git branch --del x` and `--d x` delete, so a rule listing `--delete` misses them | running git to find out what "read-only" meant, instead of reading its manual |
 | `git log`/`diff`/`show`/`shortlog --output=<file>` writes a file, and was `allow` under a rule called read-only inspection | checking the *other* subcommands of the rule I was fixing |
 | a spec line `--format=%(refname:short)` was an unquoted-parenthesis syntax error, so the gate correctly said `deny` and git errored too | the two halves of the test disagreeing about the same line |
