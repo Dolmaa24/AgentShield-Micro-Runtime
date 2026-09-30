@@ -75,7 +75,9 @@ Measure evaluation latency:
 ./target/release/shellguard bench
 ```
 
-See the sandbox profile a command would get:
+See the sandbox a command would get — what it may write, whether it has the
+network, and the kernel profile itself. It is built by the same code `run` uses,
+so it is the sandbox `run` would apply, not a reconstruction of it:
 
 ```bash
 ./target/release/shellguard profile 'cargo build'
@@ -86,17 +88,22 @@ drops into a shell wrapper without parsing anything.
 
 ## Latency
 
-M2 MacBook Air, release build, 58 000 samples over a 145-command corpus:
+M2 MacBook Air, release build, 42 400 samples over the 212-command corpus:
 
 | | full gate | parse only |
 |---|---|---|
-| p50 | 2.8 µs | 542 ns |
-| p99 | 13.4 µs | 1.5 µs |
-| max | 35.7 µs | 21.9 µs |
+| p50 | 3.4 µs | 625 ns |
+| p99 | 15 µs | 1.8 µs |
 
-Inputs built to be as expensive as the parser's limits permit peak at
-**2.40 ms** — a 2 000-stage pipeline — against a **10 ms** budget. Input over
-the 64 KiB cap is rejected in 250 ns without parsing.
+The maximum is left out because on a machine doing other work it measures the
+scheduler: 131 µs to 1.3 ms across three runs at load average 4.5. Following
+`cd` (see [DESIGN.md § 17](DESIGN.md#17-following-cd)) added 0.3 µs to the
+median.
+
+Inputs built to be as expensive as the parser's limits permit peak at about
+**2.3 ms** — a 2 000-stage pipeline — on a quiet machine, and at 4 ms with it
+busy, against a **10 ms** budget. Input over the 64 KiB cap is rejected in a
+few hundred nanoseconds without parsing.
 
 Percentiles rather than a mean, because the claim is a budget: a mean of 200 µs
 is consistent with one command in a thousand taking 50 ms, and an adversary

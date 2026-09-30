@@ -8,7 +8,6 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use shellguard_enforce::Profile;
 use shellguard_gate::{Decision, Gate, GateConfig, Worker};
 use shellguard_policy::Verdict;
 
@@ -363,23 +362,10 @@ fn print_json(src: &str, d: &Decision) {
 // -------------------------------------------------------------------- run
 
 fn cmd_run(o: &Opts) -> Result<ExitCode, String> {
-    use shellguard_runtime::{Engine, RollbackPolicy};
+    use shellguard_runtime::RollbackPolicy;
 
     let src = command_text(o)?;
-    let workspace = match &o.workspace {
-        Some(w) => w.clone(),
-        None => std::env::current_dir().map_err(|e| format!("cannot read cwd: {e}"))?,
-    };
-
-    let mut engine = Engine::new(&workspace)
-        .map_err(|e| format!("cannot open {}: {e}", workspace.display()))?
-        .run_on_ask(o.run_on_ask);
-    // A policy given on the command line must govern `run` exactly as it
-    // governs `eval`. Silently running with the built-in rules instead would let
-    // an operator validate a stricter policy and then execute under a weaker one.
-    if o.policy.is_some() {
-        engine = engine.with_gate(build_gate_with_deadline(o, None)?);
-    }
+    let mut engine = build_engine(o)?;
     if let Some(log) = open_audit(o)? {
         engine = engine.with_audit(log);
     }
@@ -451,22 +437,78 @@ fn cmd_run(o: &Opts) -> Result<ExitCode, String> {
     })
 }
 
+/// The engine `run` executes with — and `profile` describes. One function, so
+/// the two cannot drift apart.
+fn build_engine(o: &Opts) -> Result<shellguard_runtime::Engine, String> {
+    let workspace = match &o.workspace {
+        Some(w) => w.clone(),
+        None => std::env::current_dir().map_err(|e| format!("cannot read cwd: {e}"))?,
+    };
+    let mut engine = shellguard_runtime::Engine::new(&workspace)
+        .map_err(|e| format!("cannot open {}: {e}", workspace.display()))?
+        .run_on_ask(o.run_on_ask);
+    // A policy given on the command line must govern `run` exactly as it
+    // governs `eval`. Silently running with the built-in rules instead would let
+    // an operator validate a stricter policy and then execute under a weaker one.
+    if o.policy.is_some() {
+        engine = engine.with_gate(build_gate_with_deadline(o, None)?);
+    }
+    Ok(engine)
+}
+
 // ---------------------------------------------------------------- profile
 
+/// Print the sandbox `run` would put this command in.
+///
+/// It is built by the same code `run` uses — the engine's profile for the
+/// decision, then the runtime's per-run additions — because the first version
+/// rebuilt it separately and missed a step: it showed a read-only workspace
+/// for commands `run` let write.
 fn cmd_profile(o: &Opts) -> Result<ExitCode, String> {
-    let gate = build_gate(o)?;
+    let engine = build_engine(o)?;
     let src = command_text(o)?;
-    let mut worker = Worker::new();
-    let d = gate.evaluate(&src, &mut worker);
+    let d = engine.evaluate(&src);
 
     println!("# verdict: {}", d.verdict.as_str());
-    if d.verdict == Verdict::Deny {
-        println!("# denied — no profile would be built, the command does not run");
-        return Ok(exit_for(d.verdict));
+    match d.verdict {
+        Verdict::Deny => {
+            println!("# denied — no profile would be built, the command does not run");
+            return Ok(exit_for(d.verdict));
+        }
+        Verdict::Ask if !o.run_on_ask => {
+            println!("# ask — `run` would not start it without --run-on-ask;");
+            println!("# this is the profile it would get if it did");
+        }
+        _ => {}
     }
 
-    let profile = Profile::from_capabilities(gate.config().workspace.clone(), &d.capabilities);
+    // Each run gets a scratch directory of its own, named when the run starts.
+    // Shown under the directory it will be created in, with a stand-in name.
+    let parent = shellguard_runtime::scratch_parent();
+    let parent = parent.canonicalize().unwrap_or(parent);
+    let scratch = parent.join("shellguard-scratch-PER-RUN");
+    let profile = shellguard_runtime::run_profile(&engine.profile_for(&d), &scratch);
+
+    let c = profile.canonicalized();
     println!("# backend: {}", shellguard_enforce::backend());
+    println!("# workspace: {}", c.workspace.display());
+    let writable: Vec<String> = c
+        .writable()
+        .iter()
+        .map(|p| {
+            if p.as_os_str() == scratch.as_os_str() {
+                "<per-run scratch>".into()
+            } else {
+                p.display().to_string()
+            }
+        })
+        .collect();
+    println!(
+        "# writable: {}",
+        if writable.is_empty() { "nothing".to_string() } else { writable.join(", ") }
+    );
+    println!("# network: {}", if c.allow_network { "outbound" } else { "none" });
+    println!("# scratch: a new directory under {} for each run", parent.display());
     println!();
 
     #[cfg(target_os = "macos")]

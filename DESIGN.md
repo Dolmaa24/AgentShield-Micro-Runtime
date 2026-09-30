@@ -877,6 +877,7 @@ tests that found them.
 | three test fixtures shared one directory and deleted it under each other | `getcwd: cannot access parent directories` from a shell mid-test |
 | two mutants of the `cd` model survived: every script followed an `if` with `;`, which merges both outcomes, and nothing reset the state after an alias | mutation testing |
 | following `cd` first cost 1.7 µs a command, mostly re-deciding per evaluation where the shell *starts* | an A/B benchmark with only the gate's source swapped |
+| `shellguard profile` rebuilt the profile on its own, skipped the step that makes the workspace writable for `confine`, and left out the per-run scratch directory — it showed a read-only workspace for commands `run` let write | using its output as the baseline for the Mach-service experiments (§ 6.1): tools that `run` ran fine failed under the printed profile |
 | git accepts unambiguous abbreviations of long options: `git branch --del x` and `--d x` delete, so a rule listing `--delete` misses them | running git to find out what "read-only" meant, instead of reading its manual |
 | `git log`/`diff`/`show`/`shortlog --output=<file>` writes a file, and was `allow` under a rule called read-only inspection | checking the *other* subcommands of the rule I was fixing |
 | a spec line `--format=%(refname:short)` was an unquoted-parenthesis syntax error, so the gate correctly said `deny` and git errored too | the two halves of the test disagreeing about the same line |

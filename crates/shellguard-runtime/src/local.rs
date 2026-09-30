@@ -65,10 +65,7 @@ impl Runtime for LocalRuntime {
         // A scratch directory of this execution's own, rather than the shared
         // system one. Removed when the guard drops, whatever the outcome.
         let scratch = Scratch::new()?;
-        let confined = Payload {
-            profile: payload.profile.clone().with_private_tmp(scratch.path()),
-            ..payload.clone()
-        };
+        let confined = confined(payload, scratch.path());
 
         let mut cmd = self.build(&confined)?;
         base_env(&mut cmd, &confined);
@@ -81,6 +78,27 @@ impl Runtime for LocalRuntime {
     }
 }
 
+/// The profile a run of `profile` actually gets from this runtime, given the
+/// scratch directory the run was handed.
+///
+/// The one place that turns the engine's profile into the one the kernel sees.
+/// `shellguard profile` prints what this returns; if the two ever took separate
+/// routes, the printout would describe a sandbox nobody runs — which is how it
+/// once showed a read-only workspace for commands that `run` let write.
+pub fn run_profile(profile: &Profile, scratch: &std::path::Path) -> Profile {
+    profile.clone().with_private_tmp(scratch)
+}
+
+/// Where each run's scratch directory is created. The name under it differs
+/// every run.
+pub fn scratch_parent() -> std::path::PathBuf {
+    std::env::temp_dir()
+}
+
+fn confined(payload: &Payload, scratch: &std::path::Path) -> Payload {
+    Payload { profile: run_profile(&payload.profile, scratch), ..payload.clone() }
+}
+
 /// A private scratch directory, removed on drop.
 struct Scratch {
     path: std::path::PathBuf,
@@ -88,8 +106,7 @@ struct Scratch {
 
 impl Scratch {
     fn new() -> Result<Self, RuntimeError> {
-        let path =
-            std::env::temp_dir().join(crate::runtime::unique_temp_name("shellguard-scratch"));
+        let path = scratch_parent().join(crate::runtime::unique_temp_name("shellguard-scratch"));
         std::fs::create_dir_all(&path)?;
         Ok(Scratch { path })
     }
@@ -179,6 +196,26 @@ pub fn default_profile(workspace: impl Into<std::path::PathBuf>) -> Profile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `sandbox-exec` receives is what `run_profile` describes, so the
+    /// printout of one is the truth about the other.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_sandbox_gets_exactly_the_profile_run_profile_describes() {
+        let ws = workspace();
+        let scratch = ws.join("scratch-under-test");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let p = payload("touch x", &[Capability::FsWrite]);
+
+        let cmd = LocalRuntime::new().build(&confined(&p, &scratch)).unwrap();
+        let argv: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(argv[0], "-p", "expected `sandbox-exec -p <profile>`: {argv:?}");
+
+        let described =
+            shellguard_enforce::macos::profile_sbpl(&run_profile(&p.profile, &scratch)).unwrap();
+        assert_eq!(argv[1], described);
+        assert!(described.contains(&scratch.display().to_string()), "no scratch grant");
+    }
     use shellguard_policy::Capability;
     use std::path::PathBuf;
     use std::time::Duration;

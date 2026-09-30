@@ -21,7 +21,7 @@ mod sha256;
 pub mod vm;
 
 pub use engine::{Engine, GuardedRun};
-pub use local::LocalRuntime;
+pub use local::{run_profile, scratch_parent, LocalRuntime};
 pub use pool::{Lease, Pool, PoolStats, Warm};
 pub use rollback::{
     Checkpoint, ExecOutcome, GuardOutcome, HealthCheck, HealthReport, ProtectedDigest,
