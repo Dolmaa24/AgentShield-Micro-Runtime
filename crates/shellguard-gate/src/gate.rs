@@ -15,6 +15,7 @@
 //! step can block, so a check between phases is enough to bound the whole
 //! thing, and there is no thread to cancel.
 
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use shellguard_parse::parse_with_limits;
@@ -61,13 +62,15 @@ impl Worker {
 
 #[derive(Debug)]
 pub struct Gate {
-    policy: CompiledPolicy,
+    /// Swapped whole by [`Gate::reload`]; see `reload.rs` for why an evaluation
+    /// takes one snapshot and keeps it.
+    pub(crate) policy: RwLock<Arc<CompiledPolicy>>,
     config: GateConfig,
 }
 
 impl Gate {
     pub fn new(policy: CompiledPolicy, config: GateConfig) -> Self {
-        Gate { policy, config }
+        Gate { policy: RwLock::new(Arc::new(policy)), config }
     }
 
     /// A gate carrying the built-in ruleset.
@@ -79,8 +82,20 @@ impl Gate {
         &self.config
     }
 
-    pub fn policy(&self) -> &CompiledPolicy {
-        &self.policy
+    /// The policy in force right now.
+    ///
+    /// A snapshot: a later [`reload`](Gate::reload) does not change the one
+    /// returned here, which is what lets a caller read it without holding a
+    /// lock.
+    pub fn policy(&self) -> Arc<CompiledPolicy> {
+        // A poisoned lock still holds a whole `Arc`: the only write is one
+        // assignment, so there is no half-written state to be afraid of.
+        Arc::clone(&self.policy.read().unwrap_or_else(|poisoned| poisoned.into_inner()))
+    }
+
+    /// Identifies the policy in force; see `CompiledPolicy::fingerprint`.
+    pub fn policy_fingerprint(&self) -> u64 {
+        self.policy().fingerprint()
     }
 
     /// Judge a command.
@@ -94,6 +109,10 @@ impl Gate {
         w.hits.clear();
         w.cmds.clear();
 
+        // One snapshot for the whole evaluation. A reload landing mid-way must
+        // not have this command judged half by each ruleset.
+        let policy = self.policy();
+
         let ast = match parse_with_limits(src, self.config.limits) {
             Ok(a) => a,
             Err(e) => {
@@ -104,6 +123,7 @@ impl Gate {
                     commands: Vec::new(),
                     incomplete: Some(Incomplete::Parse(e.to_string())),
                     elapsed: start.elapsed(),
+                    policy_fingerprint: policy.fingerprint(),
                 };
             }
         };
@@ -174,7 +194,7 @@ impl Gate {
                 nested: cmd.nested,
                 wrap_depth: cmd.wrap_depth,
             };
-            self.policy.evaluate(&facts, &mut w.scratch, &mut w.hits);
+            policy.evaluate(&facts, &mut w.scratch, &mut w.hits);
 
             if !w.hits.is_empty() {
                 matched_any = true;
@@ -203,7 +223,7 @@ impl Gate {
         // No rule had anything to say. That is not evidence of safety, so the
         // policy's declared default applies rather than an implicit allow.
         if !matched_any {
-            verdict = verdict.join(self.policy.default_verdict());
+            verdict = verdict.join(policy.default_verdict());
         }
 
         if incomplete.is_none() && unwrap_truncated {
@@ -221,7 +241,15 @@ impl Gate {
         cmds.clear();
         w.cmds = cmds;
 
-        Decision { verdict, findings, capabilities, commands, incomplete, elapsed: start.elapsed() }
+        Decision {
+            verdict,
+            findings,
+            capabilities,
+            commands,
+            incomplete,
+            elapsed: start.elapsed(),
+            policy_fingerprint: policy.fingerprint(),
+        }
     }
 
     /// Evaluate with a one-off worker. Convenient for tests and one-shot CLI

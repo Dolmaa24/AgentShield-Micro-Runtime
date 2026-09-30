@@ -99,3 +99,28 @@ fn the_execution_timeout_is_not_handed_to_the_gate_as_its_deadline() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!err.contains("exceeded"), "the gate's deadline was set from -d: {err}");
 }
+
+#[test]
+fn rules_prints_the_fingerprint_that_decisions_carry() {
+    // The link between a file on disk and a decision in the log.
+    let sb = Sandbox::new("fingerprint");
+    let p = sb.policy(DENY_ECHO);
+    let p = p.to_str().unwrap();
+
+    let rules = Command::new(BIN).args(["rules", "--policy", p]).output().unwrap();
+    let text = String::from_utf8_lossy(&rules.stdout);
+    let fp = text
+        .lines()
+        .find_map(|l| l.strip_prefix("policy "))
+        .unwrap_or_else(|| panic!("no fingerprint line in:\n{text}"))
+        .trim()
+        .to_string();
+    assert_eq!(fp.len(), 16, "{fp}");
+
+    let eval = sb.run("eval", &["--policy", p, "--json"], "echo hi");
+    let json = String::from_utf8_lossy(&eval.stdout);
+    assert!(
+        json.contains(&format!("\"policy\":\"{fp}\"")),
+        "the decision names a different policy than `rules` printed ({fp}):\n{json}"
+    );
+}

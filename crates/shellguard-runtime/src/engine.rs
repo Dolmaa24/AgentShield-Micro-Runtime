@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use shellguard_enforce::Profile;
-use shellguard_gate::{Decision, Gate, GateConfig, Worker};
+use shellguard_gate::{Decision, Gate, GateConfig, ReloadError, ReloadMode, ReloadReport, Worker};
 use shellguard_policy::Verdict;
 
 use crate::audit::AuditLog;
@@ -228,6 +228,27 @@ impl Engine {
 
     pub fn audit(&self) -> Option<&AuditLog> {
         self.audit.as_ref()
+    }
+
+    /// Replace the ruleset of this running engine with the policy in `text`.
+    ///
+    /// Atomic: a command is judged by the old rules or the new ones, never a
+    /// mixture. A malformed policy, or (in [`ReloadMode::Strict`]) one that
+    /// lowers protection, is refused and the previous rules stay in force.
+    /// Every attempt — applied or refused — is written to the audit log when one
+    /// is attached. Takes the policy *text*, not a path, so the caller decides
+    /// what was reviewed.
+    pub fn reload_policy(&self, text: &str, mode: ReloadMode) -> Result<ReloadReport, ReloadError> {
+        let result = self.gate.reload_text(text, mode);
+        if let Some(a) = &self.audit {
+            let _ = a.policy_reloaded(text, mode, &result);
+        }
+        result
+    }
+
+    /// Identifies the ruleset in force; it is also on every [`Decision`].
+    pub fn policy_fingerprint(&self) -> u64 {
+        self.gate.policy_fingerprint()
     }
 
     /// Records that failed to write since the log was attached; zero with none.
@@ -887,5 +908,140 @@ mod tests {
                 assert!(!run.ran(), "the gate should have stopped a write outside the workspace");
             }
         }
+    }
+
+    // ------------------------------------------------------------ hot reload
+
+    /// The built-in rules plus one more: a strengthening, so it reloads under
+    /// [`ReloadMode::Strict`].
+    fn default_plus_deny_echo() -> String {
+        format!(
+            "{}\n\nrule test.no-echo deny\n  reason echo is forbidden in this test\n  program echo\n  cap fs.read\nend\n",
+            shellguard_policy::DEFAULT_POLICY_TEXT
+        )
+    }
+
+    #[test]
+    fn a_reloaded_policy_governs_the_next_execution() {
+        let r = Repo::new("reload-effect");
+        let engine = r.engine();
+
+        let run = engine.execute_with_rollback("echo ran > marker.txt").unwrap();
+        assert!(run.ran());
+        assert_eq!(r.read("marker.txt").as_deref(), Some("ran\n"));
+        std::fs::remove_file(r.dir.join("marker.txt")).unwrap();
+
+        let before = engine.policy_fingerprint();
+        engine.reload_policy(&default_plus_deny_echo(), ReloadMode::Strict).unwrap();
+        assert_ne!(engine.policy_fingerprint(), before);
+
+        let run = engine.execute_with_rollback("echo ran > marker.txt").unwrap();
+        assert!(!run.ran(), "the new rule did not take effect");
+        assert_eq!(run.decision.verdict, Verdict::Deny);
+        assert!(r.read("marker.txt").is_none(), "a command the new policy forbids ran");
+    }
+
+    #[test]
+    fn a_refused_reload_leaves_execution_behaviour_alone() {
+        let r = Repo::new("reload-refused");
+        let engine = r.engine();
+        let before = engine.policy_fingerprint();
+
+        // Valid, but nearly empty: drops every restriction the built-in has.
+        let err =
+            engine.reload_policy("version 1\ndefault allow\n", ReloadMode::Strict).unwrap_err();
+        assert!(matches!(err, ReloadError::Weakens(_)), "{err}");
+        assert!(engine.reload_policy("garbage", ReloadMode::AllowWeakening).is_err());
+
+        assert_eq!(engine.policy_fingerprint(), before);
+        assert_eq!(engine.evaluate("rm -rf /etc").verdict, Verdict::Deny);
+    }
+
+    #[test]
+    fn decisions_and_reloads_form_a_chain_the_audit_log_can_be_followed_along() {
+        let r = Repo::new("reload-chain");
+        let l = LogDir::new("reload-chain");
+        let engine = r.engine().with_audit(l.open(|c| c));
+        let text = default_plus_deny_echo();
+
+        engine.evaluate("ls");
+        let fp0 = format!("{:016x}", engine.policy_fingerprint());
+        engine.reload_policy(&text, ReloadMode::Strict).unwrap();
+        let fp1 = format!("{:016x}", engine.policy_fingerprint());
+        engine.evaluate("ls");
+        engine.execute_with_rollback("echo hi").unwrap(); // refused under the new rule
+
+        let recs = l.records();
+        let kinds: Vec<_> = recs.iter().filter_map(|x| str_of(x, "kind")).collect();
+        assert_eq!(kinds, ["header", "evaluate", "policy", "evaluate", "refused"]);
+
+        // Before the reload: judged by fp0.
+        assert_eq!(str_of(&recs[1], "policy"), Some(fp0.as_str()));
+        // The reload record links old -> new, and names the text that was loaded.
+        let p = &recs[2];
+        assert_eq!(str_of(p, "outcome"), Some("applied"));
+        assert_eq!(str_of(p, "before"), Some(fp0.as_str()));
+        assert_eq!(str_of(p, "after"), Some(fp1.as_str()));
+        assert_eq!(str_of(p, "mode"), Some("strict"));
+        assert_eq!(
+            str_of(p, "sha256"),
+            Some(crate::sha256::hex(&crate::sha256::hash(text.as_bytes())).as_str())
+        );
+        assert_eq!(p.get("bytes").and_then(json::Json::as_i64), Some(text.len() as i64));
+        let added = p.get("added").and_then(json::Json::as_array).unwrap();
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].as_str(), Some("test.no-echo"));
+        // After it: judged by fp1, including the refusal.
+        assert_eq!(str_of(&recs[3], "policy"), Some(fp1.as_str()));
+        assert_eq!(str_of(&recs[4], "policy"), Some(fp1.as_str()));
+        assert_eq!(str_of(&recs[4], "verdict"), Some("deny"));
+    }
+
+    #[test]
+    fn refused_reloads_are_recorded_too_and_say_why() {
+        let r = Repo::new("reload-audit-refused");
+        let l = LogDir::new("reload-audit-refused");
+        let engine = r.engine().with_audit(l.open(|c| c));
+
+        let weakening = "version 1\ndefault allow\n";
+        assert!(engine.reload_policy(weakening, ReloadMode::Strict).is_err());
+        assert!(engine.reload_policy("not a policy", ReloadMode::Strict).is_err());
+
+        let pol = l.of_kind("policy");
+        assert_eq!(pol.len(), 2);
+
+        assert_eq!(str_of(&pol[0], "outcome"), Some("rejected"));
+        assert!(str_of(&pol[0], "error").unwrap().contains("lower protection"));
+        let weakened = pol[0].get("weakened").and_then(json::Json::as_array).unwrap();
+        assert!(!weakened.is_empty(), "what would have been weakened was not recorded");
+        assert!(!pol[0].get("removed").and_then(json::Json::as_array).unwrap().is_empty());
+
+        assert_eq!(str_of(&pol[1], "outcome"), Some("rejected"));
+        assert!(str_of(&pol[1], "error").unwrap().contains("previous policy still in force"));
+        assert!(pol[1].get("weakened").is_none(), "an unparseable policy has no diff to record");
+    }
+
+    #[test]
+    fn allowing_weakening_is_visible_in_the_record() {
+        let r = Repo::new("reload-audit-weaken");
+        let l = LogDir::new("reload-audit-weaken");
+        let engine = r.engine().with_audit(l.open(|c| c));
+
+        engine.reload_policy("version 1\ndefault confine\n", ReloadMode::AllowWeakening).unwrap();
+        let p = &l.of_kind("policy")[0];
+        assert_eq!(str_of(p, "outcome"), Some("applied"));
+        assert_eq!(str_of(p, "mode"), Some("allow-weakening"));
+        assert!(
+            !p.get("weakened").and_then(json::Json::as_array).unwrap().is_empty(),
+            "a weakening that was allowed must still say what it weakened"
+        );
+    }
+
+    #[test]
+    fn a_reload_without_an_audit_log_still_works() {
+        let r = Repo::new("reload-no-audit");
+        let engine = r.engine();
+        assert!(engine.reload_policy(&default_plus_deny_echo(), ReloadMode::Strict).is_ok());
+        assert_eq!(engine.audit_failures(), 0);
     }
 }

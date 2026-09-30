@@ -231,6 +231,7 @@ pub unsafe extern "C" fn sg_evaluate(
                     "command is not valid UTF-8".into(),
                 )),
                 elapsed: Duration::ZERO,
+                policy_fingerprint: 0,
             };
             return build_decision("", &d);
         };
@@ -617,6 +618,13 @@ pub const SG_AUDIT_VERBOSE: u32 = 1 << 0;
 /// when an unaudited command is worse than a refused one.
 pub const SG_AUDIT_REQUIRED: u32 = 1 << 1;
 
+/// Accept a policy reload that lowers protection.
+///
+/// Off by default. A reload that removes a restriction, lowers a verdict, or
+/// adds a rule more permissive than the default is refused unless this is set,
+/// because a policy file cut short by a failed write looks exactly like that.
+pub const SG_RELOAD_ALLOW_WEAKENING: u32 = 1 << 0;
+
 #[derive(Debug)]
 pub struct sg_engine {
     engine: shellguard_runtime::Engine,
@@ -797,6 +805,74 @@ pub unsafe extern "C" fn sg_engine_set_audit(
 pub unsafe extern "C" fn sg_engine_audit_failures(engine: *const sg_engine) -> u64 {
     // SAFETY: the contract on this function is exactly `as_ref`'s.
     unsafe { engine.as_ref() }.map_or(0, |e| e.engine.audit_failures())
+}
+
+/// Replace the ruleset of a running engine. Returns an owned JSON report for
+/// [`sg_string_free`], or NULL with a message in `err_out` — and in every NULL
+/// case the previous rules are still in force.
+///
+/// Takes the policy **text**, not a path: the caller decides what was reviewed,
+/// and there is no gap between checking a file and reading it. Text is parsed and
+/// compiled in full before anything changes, so a malformed policy never
+/// displaces a good one. Atomic with respect to judgments: a command is judged
+/// entirely by the old rules or entirely by the new ones.
+///
+/// Unknown flag bits are refused rather than ignored.
+///
+/// # Safety
+/// `engine` must be a valid pointer from [`sg_engine_new`] and `policy_text` a
+/// valid NUL-terminated C string; `err_out` NULL or a writable `char*`. Safe to
+/// call while other threads are judging or executing on the same engine.
+#[no_mangle]
+pub unsafe extern "C" fn sg_engine_reload_policy(
+    engine: *const sg_engine,
+    policy_text: *const c_char,
+    flags: u32,
+    err_out: *mut *mut c_char,
+) -> *mut c_char {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: contract above.
+        let e = unsafe { engine.as_ref() }.ok_or("engine must not be NULL")?;
+        // SAFETY: contract above.
+        let text = unsafe { opt_str(policy_text) }
+            .ok_or("policy text must not be NULL")?
+            .to_str()
+            .map_err(|_| "policy text is not valid UTF-8")?;
+        if flags & !SG_RELOAD_ALLOW_WEAKENING != 0 {
+            return Err(format!("unknown reload flags {:#x}", flags & !SG_RELOAD_ALLOW_WEAKENING));
+        }
+        let mode = if flags & SG_RELOAD_ALLOW_WEAKENING != 0 {
+            shellguard_gate::ReloadMode::AllowWeakening
+        } else {
+            shellguard_gate::ReloadMode::Strict
+        };
+        e.engine.reload_policy(text, mode).map(|r| r.to_json()).map_err(|err| err.to_string())
+    }));
+
+    match result {
+        Ok(Ok(json)) => cstring(&json).into_raw(),
+        Ok(Err(msg)) => {
+            // SAFETY: contract above.
+            unsafe { write_err(err_out, &msg) };
+            std::ptr::null_mut()
+        }
+        Err(_) => {
+            // SAFETY: contract above.
+            unsafe { write_err(err_out, "panic while reloading the policy") };
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Identifies the ruleset in force, as it does on every decision (`"policy"` in
+/// the JSON, in hex). Zero for NULL.
+///
+/// # Safety
+/// `engine` must be NULL or a valid pointer from [`sg_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn sg_engine_policy_fingerprint(engine: *const sg_engine) -> u64 {
+    // SAFETY: the contract on this function is exactly `as_ref`'s.
+    unsafe { engine.as_ref() }.map_or(0, |e| e.engine.policy_fingerprint())
 }
 
 /// Judge a command without running it. Returns owned JSON for
@@ -1093,6 +1169,236 @@ mod audit_tests {
             "the command ran although it could not be recorded"
         );
 
+        unsafe { sg_engine_free(e) };
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    // Same reasoning as the other test modules: every call crosses the C
+    // boundary, and every pointer comes from a constructor here and is freed
+    // exactly once.
+    #![allow(clippy::undocumented_unsafe_blocks)]
+
+    use super::*;
+    use shellguard_runtime::json;
+
+    fn c(s: &str) -> CString {
+        CString::new(s).unwrap()
+    }
+
+    struct Ws(PathBuf);
+    impl Ws {
+        fn new(name: &str) -> Ws {
+            let p = std::env::temp_dir()
+                .join(format!("shellguard-ffi-reload-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            Ws(p.canonicalize().unwrap())
+        }
+    }
+    impl Drop for Ws {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn engine(ws: &Ws) -> *mut sg_engine {
+        let w = c(ws.0.to_str().unwrap());
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let e = unsafe { sg_engine_new(w.as_ptr(), std::ptr::null(), 0, 0, &mut err) };
+        assert!(!e.is_null());
+        e
+    }
+
+    fn reload(e: *const sg_engine, text: &str, flags: u32) -> Result<json::Json, String> {
+        let t = c(text);
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let out = unsafe { sg_engine_reload_policy(e, t.as_ptr(), flags, &mut err) };
+        if out.is_null() {
+            assert!(!err.is_null(), "failure with no message");
+            let m = unsafe { CStr::from_ptr(err) }.to_str().unwrap().to_string();
+            unsafe { sg_string_free(err) };
+            Err(m)
+        } else {
+            assert!(err.is_null());
+            let s = unsafe { CStr::from_ptr(out) }.to_str().unwrap().to_string();
+            unsafe { sg_string_free(out) };
+            Ok(json::parse(&s).unwrap_or_else(|e| panic!("{e}: {s}")))
+        }
+    }
+
+    fn eval(e: *const sg_engine, cmd: &str) -> json::Json {
+        let s = c(cmd);
+        let out = unsafe { sg_engine_eval_json(e, s.as_ptr()) };
+        assert!(!out.is_null());
+        let text = unsafe { CStr::from_ptr(out) }.to_str().unwrap().to_string();
+        unsafe { sg_string_free(out) };
+        json::parse(&text).unwrap()
+    }
+
+    fn s<'a>(v: &'a json::Json, k: &str) -> &'a str {
+        v.get(k).and_then(json::Json::as_str).unwrap_or_else(|| panic!("no `{k}` in {v:?}"))
+    }
+
+    fn plus_deny_echo() -> String {
+        format!(
+            "{}\n\nrule test.no-echo deny\n  reason forbidden in this test\n  program echo\n  cap fs.read\nend\n",
+            shellguard_policy::DEFAULT_POLICY_TEXT
+        )
+    }
+
+    #[test]
+    fn a_reload_reports_what_changed_and_takes_effect() {
+        let ws = Ws::new("effect");
+        let e = engine(&ws);
+        assert_eq!(s(&eval(e, "echo hi"), "verdict"), "allow");
+        let fp0 = unsafe { sg_engine_policy_fingerprint(e) };
+
+        let rep = reload(e, &plus_deny_echo(), 0).unwrap();
+
+        assert_eq!(s(&rep, "before"), format!("{fp0:016x}"));
+        let fp1 = unsafe { sg_engine_policy_fingerprint(e) };
+        assert_ne!(fp0, fp1);
+        assert_eq!(s(&rep, "after"), format!("{fp1:016x}"));
+        assert_eq!(rep.get("changed").and_then(json::Json::as_bool), Some(true));
+        let added = rep.get("added").and_then(json::Json::as_array).unwrap();
+        assert_eq!(added[0].as_str(), Some("test.no-echo"));
+
+        let d = eval(e, "echo hi");
+        assert_eq!(s(&d, "verdict"), "deny");
+        assert_eq!(s(&d, "policy"), format!("{fp1:016x}"), "the decision must name the new policy");
+        unsafe { sg_engine_free(e) };
+    }
+
+    #[test]
+    fn a_weakening_reload_is_refused_unless_the_flag_is_set() {
+        let ws = Ws::new("weaken");
+        let e = engine(&ws);
+        let fp = unsafe { sg_engine_policy_fingerprint(e) };
+        let weak = "version 1\ndefault allow\n";
+
+        let msg = reload(e, weak, 0).unwrap_err();
+        assert!(msg.contains("lower protection"), "{msg}");
+        assert!(msg.contains("previous policy still in force"), "{msg}");
+        assert_eq!(
+            unsafe { sg_engine_policy_fingerprint(e) },
+            fp,
+            "a refused reload changed the policy"
+        );
+        assert_eq!(s(&eval(e, "rm -rf /etc"), "verdict"), "deny");
+
+        let rep = reload(e, weak, SG_RELOAD_ALLOW_WEAKENING).unwrap();
+        assert!(!rep.get("weakened").and_then(json::Json::as_array).unwrap().is_empty());
+        assert_ne!(unsafe { sg_engine_policy_fingerprint(e) }, fp);
+        unsafe { sg_engine_free(e) };
+    }
+
+    #[test]
+    fn a_malformed_policy_is_refused_even_with_weakening_allowed() {
+        let ws = Ws::new("malformed");
+        let e = engine(&ws);
+        let fp = unsafe { sg_engine_policy_fingerprint(e) };
+        for bad in ["", "garbage", "version 1\nrule x deny\n", "\u{1}\u{2}\u{7f}"] {
+            let msg = reload(e, bad, SG_RELOAD_ALLOW_WEAKENING).unwrap_err();
+            assert!(msg.contains("previous policy still in force"), "`{bad:?}`: {msg}");
+        }
+        assert_eq!(unsafe { sg_engine_policy_fingerprint(e) }, fp);
+        unsafe { sg_engine_free(e) };
+    }
+
+    #[test]
+    fn bad_arguments_are_errors_with_messages_not_crashes() {
+        let ws = Ws::new("args");
+        let e = engine(&ws);
+        let t = c(&plus_deny_echo());
+        let mut err: *mut c_char = std::ptr::null_mut();
+
+        // NULL engine, NULL text.
+        assert!(
+            unsafe { sg_engine_reload_policy(std::ptr::null(), t.as_ptr(), 0, &mut err) }.is_null()
+        );
+        unsafe { sg_string_free(err) };
+        err = std::ptr::null_mut();
+        assert!(unsafe { sg_engine_reload_policy(e, std::ptr::null(), 0, &mut err) }.is_null());
+        unsafe { sg_string_free(err) };
+        // NULL err_out is tolerated.
+        assert!(unsafe { sg_engine_reload_policy(e, std::ptr::null(), 0, std::ptr::null_mut()) }
+            .is_null());
+
+        // Unknown flags are refused, and the policy is not applied.
+        let fp = unsafe { sg_engine_policy_fingerprint(e) };
+        let msg = reload(e, &plus_deny_echo(), 1 << 5).unwrap_err();
+        assert!(msg.contains("unknown reload flags"), "{msg}");
+        assert_eq!(unsafe { sg_engine_policy_fingerprint(e) }, fp);
+
+        // Not UTF-8.
+        let bytes = CString::new(vec![0xff_u8, 0xfe, b'x']).unwrap();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        assert!(unsafe { sg_engine_reload_policy(e, bytes.as_ptr(), 0, &mut err) }.is_null());
+        assert!(unsafe { CStr::from_ptr(err) }.to_str().unwrap().contains("UTF-8"));
+        unsafe { sg_string_free(err) };
+
+        assert_eq!(unsafe { sg_engine_policy_fingerprint(std::ptr::null()) }, 0);
+        unsafe { sg_engine_free(e) };
+    }
+
+    #[test]
+    fn judgments_racing_reloads_are_always_wholly_one_policy() {
+        // Through the public surface, with raw pointers shared across threads.
+        let ws = Ws::new("race");
+        let e = engine(&ws);
+        let denies = plus_deny_echo();
+        let plain = shellguard_policy::DEFAULT_POLICY_TEXT.to_string();
+
+        let fp_a = format!(
+            "{:016x}",
+            shellguard_policy::parse_policy(&denies).unwrap().compile().fingerprint()
+        );
+        let fp_b = format!(
+            "{:016x}",
+            shellguard_policy::parse_policy(&plain).unwrap().compile().fingerprint()
+        );
+
+        let addr = e as usize;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let evaluators: Vec<_> = (0..3)
+            .map(|_| {
+                let (stop, fp_a, fp_b) = (stop.clone(), fp_a.clone(), fp_b.clone());
+                std::thread::spawn(move || {
+                    let e = addr as *const sg_engine;
+                    let mut seen = (0, 0);
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let d = eval(e, "echo hi");
+                        let (p, v) = (s(&d, "policy").to_string(), s(&d, "verdict").to_string());
+                        if p == fp_a {
+                            assert_eq!(v, "deny", "policy A named with B's verdict");
+                            seen.0 += 1;
+                        } else if p == fp_b {
+                            assert_eq!(v, "allow", "policy B named with A's verdict");
+                            seen.1 += 1;
+                        } else {
+                            panic!("a decision named a policy that was never installed: {p}");
+                        }
+                    }
+                    seen
+                })
+            })
+            .collect();
+
+        for i in 0..400 {
+            let text = if i % 2 == 0 { &plain } else { &denies };
+            reload(e, text, SG_RELOAD_ALLOW_WEAKENING).unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let (mut a, mut b) = (0, 0);
+        for h in evaluators {
+            let (x, y) = h.join().expect("an evaluator panicked");
+            a += x;
+            b += y;
+        }
+        assert!(a > 0 && b > 0, "never observed both policies ({a}, {b}); the test raced nothing");
         unsafe { sg_engine_free(e) };
     }
 }

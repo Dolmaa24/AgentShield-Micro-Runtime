@@ -11,7 +11,7 @@ use shellguard_policy::{Capability, Verdict};
 /// carries attacker-influenced command text, and a raw newline or terminal
 /// escape sequence in a log line is how a refusal gets made to look like an
 /// approval in whatever reads it next.
-fn json_str(out: &mut String, s: &str) {
+pub(crate) fn json_str(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {
         match c {
@@ -102,6 +102,12 @@ pub struct Decision {
     /// never [`Verdict::Allow`].
     pub incomplete: Option<Incomplete>,
     pub elapsed: Duration,
+    /// Identifies the ruleset that made this decision.
+    ///
+    /// Once rules can be reloaded under a running process, "denied by rule X"
+    /// is not enough to reconstruct a refusal — it matters which version of the
+    /// rules X was in. Compare with `CompiledPolicy::fingerprint`.
+    pub policy_fingerprint: u64,
 }
 
 impl Decision {
@@ -126,6 +132,7 @@ impl Decision {
         s.push_str(",\"verdict\":");
         json_str(&mut s, self.verdict.as_str());
         s.push_str(&format!(",\"elapsed_ns\":{}", self.elapsed.as_nanos()));
+        s.push_str(&format!(",\"policy\":\"{:016x}\"", self.policy_fingerprint));
         s.push_str(&format!(",\"complete\":{}", self.incomplete.is_none()));
         if let Some(i) = &self.incomplete {
             s.push_str(",\"incomplete\":");

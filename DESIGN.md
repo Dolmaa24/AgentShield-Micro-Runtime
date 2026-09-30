@@ -654,7 +654,14 @@ the longest existing ancestor, which catches a symlinked parent. It cannot catch
 a symlink created between the decision and the command running. This is not a
 bug to fix in the gate — it is why the gate is not the boundary.
 
-**No policy hot-reload.** Changing rules requires restarting the gate.
+**Policy reload is in-process only, and its guard is a tripwire.** The
+command-line tool reads its policy fresh each invocation and has no reload; the
+`sg_gate_*` C API has none either (only `sg_engine_*`). The weakening check
+(§ 15) sees removals, verdict decreases and permissive additions; it cannot see a
+rule whose predicates were loosened while its verdict stayed put — those are
+listed as `modified` for a human to read. The `policy` audit record is written
+after the change and is best-effort even under `--audit-required`. Fingerprints
+identify content within a build and are not stable across releases.
 
 ## 13. Findings from building it
 
@@ -679,6 +686,11 @@ tests that found them.
 | test helpers for the log and the repo resolved to one directory, so creating the log deleted the repository under test | an engine test finding `tracked.txt` missing |
 | "stdout is not recorded" asserted against a string the command text itself contains, which is (correctly) recorded | the test failing on the wrong thing |
 | a tamper test that only let the gate refuse the command said nothing about the kernel | asking which layer had stopped it |
+| `shellguard run` silently ignored `--policy` while `eval` honoured it | reading `cmd_run` while designing reload |
+| a policy block pasted twice was accepted by the parser and double-reported every match | a unit test, not the parser |
+| a "did not run" assertion searched stdout for text the refusal message itself prints | the test failing on the wrong thing |
+| a multi-workspace test assumed two engine handles when handles are created lazily | the test failing |
+| a test built a C string containing NUL, which a C string cannot | the test failing to construct its input |
 
 The `git stash create` correction in § 7 belongs here too: the first draft of
 this document asserted it mutates the working tree. Measuring it showed
@@ -769,3 +781,70 @@ paid so that concurrent processes cannot corrupt each other.
 log appear in it. A command run any other way is invisible, and a quiet log is
 not evidence of a quiet agent. Each file's header carries a `coverage` field
 saying so, so the caveat travels with the data.
+
+## 15. Reloading the policy
+
+`Engine::reload_policy` (Rust), `sg_engine_reload_policy` (C ABI) and
+`SandboxEngine.reload_policy` (Python) replace the ruleset of a running engine.
+The implementation is `reload.rs` in `shellguard-gate`.
+
+**Why it needs care.** A policy that was a constant for the life of the process
+was friction and also a checkpoint. Reload removes the friction, which is the
+point; the design is about not removing the checkpoint with it.
+
+**Atomic.** The policy sits behind `RwLock<Arc<CompiledPolicy>>` (std only; the
+zero-dependency rule holds). An evaluation takes one snapshot at its start and
+uses it throughout, so a command is judged entirely by the old rules or entirely
+by the new ones, and one already in flight finishes against the rules it started
+with. Verified with evaluators racing 3,000 reloads: every decision's fingerprint
+and verdict agree. Re-reading the policy mid-evaluation — the obvious bug — fails
+that test in 6 of 6 runs.
+
+**A bad file never replaces a good policy.** Text is parsed and compiled in full
+before anything is touched; any error leaves the previous policy in force. This
+holds even when weakening is allowed: permission to loosen is not permission to
+be invalid. The parser also now rejects duplicate rule ids, which had got into the
+built-in policy once already and which no unit test stands guard against in a
+live reload.
+
+**A file that parses can still be worse.** A half-written save is a prefix of the
+file, and a prefix cut between two rules is a valid, smaller policy. So a reload
+is diffed against what it replaces, and one that lowers protection is refused
+unless the caller passes `allow_weakening`. Weakening means: removing a rule that
+restricted something, lowering a rule's verdict, lowering the default, or adding
+a rule more permissive than the default (a matching `allow` rule *replaces* the
+default rather than joining it, so this genuinely lowers scrutiny). The property
+is tested on the real policy by cutting it at every line: every cut inside a rule
+fails to parse, and every cut between rules that dropped a restriction is flagged.
+
+It is a **tripwire, not a proof.** It cannot see a rule whose predicates were
+loosened while its verdict stayed the same; those appear as `modified` in the
+report for a human to read. The check is against what is *in force*, not what was
+first loaded, so returning to the original after strengthening is itself a
+weakening.
+
+**Explicit, and text not a path.** There is no file watcher: a watcher reacts to
+a save in progress, which is the failure being avoided, and it turns "who changed
+the rules" into a question about the filesystem. The API takes the policy *text*,
+so an embedding application decides what was reviewed and there is no gap between
+checking a file and reading it. There is no path parameter anywhere.
+
+**Traceable.** Every decision carries a `policy` fingerprint (FNV-1a over the
+rules' canonical form; 16 hex digits), and every reload — applied or refused — is
+a `policy` record in the audit log with the SHA-256 of the text offered, the
+fingerprints before and after, and what was added, removed, modified and
+weakened. A `start` before a reload and a `refused` after it name different
+policies, and the `policy` record between them links the two. Refused reloads are
+recorded because someone pushing a malformed or quietly-weakening policy is the
+event an audit trail is for.
+
+**Several workspaces.** The Python binding builds one engine handle per workspace,
+lazily. A reload is applied to every existing handle and remembered, and replayed
+onto any handle created later — otherwise a workspace first used after a reload
+would quietly run the built-in rules. The first handle is judged under the
+caller's strictness and the rest are replicas of that vetted state, so a refusal
+can only come before anything has changed.
+
+**Cost.** One `Arc` clone and a read lock per judgment. Measured A/B against the
+commit before, alternating runs: p50 2.7–2.9 µs on both, p99 12–15 µs on both.
+Within noise.

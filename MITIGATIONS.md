@@ -118,20 +118,31 @@ used for the filesystem tests in `local.rs`.
 
 ### 6. No policy hot-reload
 
-**The fix.** `CompiledPolicy` moves behind `RwLock<Arc<CompiledPolicy>>` (no
-new dependency — the workspace's zero-external-deps constraint holds; this is
-`std` only), so every evaluation reads a fresh, whole `Arc` and never a torn
-one. Reload is **explicit only** — a `shellguard reload` command or an
-`sg_engine_reload_policy(path)` FFI call — deliberately not a filesystem
-watcher, because a watcher reacting to a half-written save is exactly the
-TOCTOU this would introduce for no real benefit. The new text is parsed and
-compiled *in full* before anything swaps; on any error, the old `Arc` keeps
-serving traffic and the error goes back to the caller. There is no code path
-where a bad policy file results in a more permissive one.
+**Status: built and verified.** Design, limits and measurements are in
+[DESIGN.md § 15](DESIGN.md#15-reloading-the-policy).
 
-**How we'd know.** A test that reloads a deliberately malformed policy file
-mid-run and asserts the previous ruleset is still the one being evaluated
-against — the fail-closed property stated as a test, not a comment.
+Built as planned: the policy sits behind `RwLock<Arc<…>>` (std only), every
+evaluation takes one snapshot and keeps it, reload is explicit and takes text,
+and text is parsed and compiled in full before anything swaps. A bad file never
+replaces a good policy — verified by a test that breaks exactly that and fails.
+
+Where it went beyond or away from the plan, and why:
+
+- **No `shellguard reload` / SIGHUP / `serve` daemon.** There is no daemon: the
+  CLI is one process per invocation and reads its policy fresh each time, so it
+  has nothing to reload. Reload is an API for long-lived embedders (Rust, C,
+  Python).
+- **A weakening guard, not planned.** A file cut short by a failed write parses
+  as a valid, smaller policy, so "a malformed file is rejected" does not cover
+  the scenario that motivated the item. Reload now diffs against what it replaces
+  and refuses a change that lowers protection unless told otherwise. Tested by
+  cutting the real built-in policy at every line.
+- **Fingerprints on decisions**, so a refusal can be tied to the rules that made
+  it once rules can change.
+- **Duplicate rule ids are rejected by the parser.** A block pasted twice had
+  already got into the built-in policy once; a live reload has no unit test in
+  the loop to catch it.
+- Found on the way: `shellguard run` silently ignored `--policy` (fixed).
 
 ### 7. Three of four backends are unverified end to end
 
@@ -276,6 +287,22 @@ rotation triggers at the configured size; a test asserting the header
 correctly reflects which integration points were live.
 
 ### 18–19. Policy hot-reload: fail-open, unreviewed live control
+
+**Status: built and verified**, with one deliberate difference from the plan.
+
+- *Fail-open* — a bad reload never replaces the active policy (item 6).
+- *Unreviewed live control* — reload takes the policy **text**; there is no path
+  parameter at all, in the C ABI or in Python (`reload_policy` raises `TypeError`
+  on anything but `str`). The planned "text-only mode" as a compile-time switch
+  became the only mode, which makes the planned test moot. On top of that, a
+  weakening change is refused unless `allow_weakening` is passed, and every
+  attempt — applied or refused — is written to the audit log with the SHA-256 of
+  the text offered.
+
+What remains process rather than code, as the original entry said: who is allowed
+to call reload, and the permissions on the file the embedder reads the text from.
+
+The original plan for this entry follows, unchanged, for the record.
 
 Fail-open is covered by item 6's core design — a bad reload never replaces
 the active policy. The second risk, that the policy file becomes a live

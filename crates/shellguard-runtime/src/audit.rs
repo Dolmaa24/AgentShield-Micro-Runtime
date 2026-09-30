@@ -71,7 +71,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use shellguard_gate::Decision;
+use shellguard_gate::{Decision, ReloadError, ReloadMode, ReloadReport};
 
 use crate::engine::GuardedRun;
 use crate::redact;
@@ -319,6 +319,66 @@ impl AuditLog {
         self.emit(r)
     }
 
+    /// The rules were replaced, or an attempt to replace them was refused.
+    ///
+    /// Written for refusals too: someone pushing a malformed policy, or one that
+    /// quietly removes a restriction, is precisely the event an audit trail is
+    /// for. The record carries the SHA-256 of the text offered, so a policy that
+    /// was applied can later be matched to the file that was applied.
+    ///
+    /// Unlike a `start`, this is written *after* the change and is best-effort
+    /// whatever [`AuditConfig::required`] says: `required` guards commands the
+    /// agent asks to run, and a reload is an operator's act that an agent cannot
+    /// trigger.
+    pub fn policy_reloaded(
+        &self,
+        text: &str,
+        mode: ReloadMode,
+        result: &Result<ReloadReport, ReloadError>,
+    ) -> io::Result<()> {
+        let mut r = self.rec("policy");
+        r.str("sha256", &crate::sha256::hex(&crate::sha256::hash(text.as_bytes())));
+        r.int("bytes", text.len() as i64);
+        r.str(
+            "mode",
+            match mode {
+                ReloadMode::Strict => "strict",
+                ReloadMode::AllowWeakening => "allow-weakening",
+            },
+        );
+
+        let diff = match result {
+            Ok(rep) => {
+                r.str("outcome", "applied");
+                r.str("before", &format!("{:016x}", rep.before));
+                r.str("after", &format!("{:016x}", rep.after));
+                r.int("rules", rep.rules as i64);
+                r.bool("changed", rep.changed());
+                Some(&rep.diff)
+            }
+            Err(ReloadError::Weakens(d)) => {
+                r.str("outcome", "rejected");
+                self.text(&mut r, "error", &result.as_ref().unwrap_err().to_string());
+                Some(d)
+            }
+            Err(e @ ReloadError::Invalid(_)) => {
+                r.str("outcome", "rejected");
+                self.text(&mut r, "error", &e.to_string());
+                None
+            }
+        };
+
+        if let Some(d) = diff {
+            self.text_list(&mut r, "added", d.added.iter());
+            self.text_list(&mut r, "removed", d.removed.iter());
+            self.text_list(&mut r, "modified", d.changed.iter());
+            self.text_list(&mut r, "weakened", d.weakened.iter());
+            r.str("default_before", d.default_before.as_str());
+            r.str("default_after", d.default_after.as_str());
+        }
+        self.emit(r)
+    }
+
     // ------------------------------------------------------------- field help
 
     fn rec(&self, kind: &str) -> Rec {
@@ -372,6 +432,10 @@ impl AuditLog {
 
     fn decision_fields(&self, r: &mut Rec, d: &Decision) {
         r.str("verdict", d.verdict.as_str());
+        // Which ruleset judged it. With reloadable rules, "denied by rule X"
+        // does not say which version of X; the `policy` record maps this to the
+        // text that was loaded.
+        r.str("policy", &format!("{:016x}", d.policy_fingerprint));
         r.bool("complete", d.incomplete.is_none());
         if let Some(i) = &d.incomplete {
             self.text(r, "incomplete", &i.to_string());

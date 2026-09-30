@@ -47,7 +47,12 @@ impl std::error::Error for PolicyError {}
 pub fn parse_policy(src: &str) -> Result<Policy, PolicyError> {
     let mut policy = Policy { version: 0, default_verdict: Verdict::Confine, rules: Vec::new() };
     let mut current: Option<Rule> = None;
+    let mut current_line = 0usize;
     let mut any_block: Option<Vec<Pred>> = None;
+    // Where each rule id was first defined. Two rules with one id make every
+    // finding ambiguous and every diff wrong, and they are exactly what a
+    // copy-paste produces; a live reload has no unit test to catch them.
+    let mut defined_at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
     for (i, raw) in src.lines().enumerate() {
         let line = i + 1;
@@ -87,6 +92,13 @@ pub fn parse_policy(src: &str) -> Result<Policy, PolicyError> {
                 return Err(err("`rule` inside a rule; missing `end`".into()));
             }
             let id = args.first().ok_or_else(|| err("`rule` needs an id".into()))?.clone();
+            if let Some(first) = defined_at.get(&id) {
+                return Err(err(format!(
+                    "duplicate rule id `{id}` (first defined on line {first})"
+                )));
+            }
+            defined_at.insert(id.clone(), line);
+            current_line = line;
             let verdict_tok =
                 args.get(1).ok_or_else(|| err(format!("rule `{id}` needs a verdict")))?;
             let verdict = Verdict::parse(verdict_tok)
@@ -111,7 +123,7 @@ pub fn parse_policy(src: &str) -> Result<Policy, PolicyError> {
             }
             let rule = current.take().ok_or_else(|| err("`end` without `rule`".into()))?;
             if rule.reason.is_empty() {
-                return Err(err(format!("rule `{}` has no reason", rule.id)));
+                return Err(err(format!("rule `{}` (line {current_line}) has no reason", rule.id)));
             }
             if rule.programs.is_empty() && rule.preds.is_empty() {
                 // A rule with no program and no predicate matches everything,

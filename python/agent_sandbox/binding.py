@@ -42,6 +42,7 @@ __all__ = [
     "Finding",
     "Verdict",
     "SandboxError",
+    "PolicyRejected",
     "LibraryNotFound",
     "find_library",
 ]
@@ -57,9 +58,20 @@ AUDIT_VERBOSE = 1 << 0
 #: Audit log: refuse to run a command whose record cannot be written.
 AUDIT_REQUIRED = 1 << 1
 
+#: Policy reload: accept a change that lowers protection.
+RELOAD_ALLOW_WEAKENING = 1 << 0
+
 
 class SandboxError(RuntimeError):
     """The engine could not be built, or the library misbehaved."""
+
+
+class PolicyRejected(SandboxError):
+    """A policy reload was refused. The previous policy is still in force.
+
+    Either the text is not a valid policy, or it would lower protection and
+    ``allow_weakening`` was not set. The message says which, and what.
+    """
 
 
 class LibraryNotFound(SandboxError):
@@ -145,6 +157,12 @@ def _bind(lib: ctypes.CDLL) -> None:
 
     lib.sg_engine_audit_failures.argtypes = [ctypes.c_void_p]
     lib.sg_engine_audit_failures.restype = ctypes.c_uint64
+
+    lib.sg_engine_reload_policy.argtypes = [ctypes.c_void_p, c, ctypes.c_uint32, ctypes.POINTER(p)]
+    lib.sg_engine_reload_policy.restype = p
+
+    lib.sg_engine_policy_fingerprint.argtypes = [ctypes.c_void_p]
+    lib.sg_engine_policy_fingerprint.restype = ctypes.c_uint64
 
     # Returned as a raw pointer, never as c_char_p: ctypes converts c_char_p to
     # bytes and discards the pointer, so the allocation could never be freed.
@@ -238,6 +256,10 @@ class Decision:
     capabilities: tuple[str, ...] = ()
     incomplete: str | None = None
     elapsed_ns: int = 0
+    #: Identifies the ruleset that made this decision (hex). Compare with
+    #: ``SandboxEngine.policy_fingerprint``. Once rules can be reloaded, "denied
+    #: by rule X" does not say which version of X.
+    policy: str = ""
 
     @property
     def allowed(self) -> bool:
@@ -270,6 +292,7 @@ class Decision:
             capabilities=tuple(d.get("capabilities", ())),
             incomplete=d.get("incomplete"),
             elapsed_ns=int(d.get("elapsed_ns", 0)),
+            policy=d.get("policy", ""),
         )
 
 
@@ -389,6 +412,10 @@ class SandboxEngine:
         self._audit_flags = (AUDIT_VERBOSE if audit_verbose else 0) | (
             AUDIT_REQUIRED if audit_required else 0
         )
+        # The last policy accepted by `reload_policy`, replayed onto any engine
+        # handle created afterwards. Handles are built lazily per workspace, and
+        # one built after a reload must not quietly run the built-in rules.
+        self._policy_text: str | None = None
         self._engines: dict[Path, int] = {}
         self._lock = threading.Lock()
         self._closed = False
@@ -441,6 +468,57 @@ class SandboxEngine:
                 int(self._lib.sg_engine_audit_failures(ctypes.c_void_p(h)))
                 for h in self._engines.values()
             )
+
+    @property
+    def policy_fingerprint(self) -> str:
+        """Identifies the ruleset in force (hex); also ``Decision.policy``."""
+        handle = self._handle(self._default_workspace)
+        return f"{int(self._lib.sg_engine_policy_fingerprint(ctypes.c_void_p(handle))):016x}"
+
+    def reload_policy(self, text: str, *, allow_weakening: bool = False) -> dict[str, Any]:
+        """Replace the rules of this running engine with the policy in ``text``.
+
+        Takes the policy *text*, not a path, so the caller decides what was
+        reviewed and there is no gap between checking a file and reading it.
+
+        Atomic: a command is judged wholly by the old rules or wholly by the new
+        ones. If the text is malformed, or would lower protection and
+        ``allow_weakening`` is not set, this raises :class:`PolicyRejected` and
+        the previous rules stay in force. That includes a file cut short by a
+        failed write, which parses as a valid but smaller policy.
+
+        Returns the report: ``before``/``after`` fingerprints, and which rules
+        were ``added``, ``removed`` or ``modified``.
+        """
+        if not isinstance(text, str):
+            raise TypeError("policy text must be a str, not " + type(text).__name__)
+
+        # Make sure there is a handle to validate against before taking the lock
+        # (`_handle` takes it too, and is not re-entrant).
+        self._handle(self._default_workspace)
+        flags = RELOAD_ALLOW_WEAKENING if allow_weakening else 0
+
+        with self._lock:
+            handles = list(self._engines.values())
+            # The first handle is judged under the caller's strictness. The rest
+            # are replicas of the same state, so the change has already been
+            # vetted; allowing weakening for them means a refusal can only come
+            # from the first, before anything has changed.
+            report = self._reload_one(handles[0], text, flags)
+            for h in handles[1:]:
+                self._reload_one(h, text, RELOAD_ALLOW_WEAKENING)
+            self._policy_text = text
+        return report
+
+    def _reload_one(self, handle: int, text: str, flags: int) -> dict[str, Any]:
+        err = ctypes.POINTER(ctypes.c_char)()
+        out = self._lib.sg_engine_reload_policy(
+            ctypes.c_void_p(handle), text.encode(), ctypes.c_uint32(flags), ctypes.byref(err)
+        )
+        if not out:
+            message = _take_string(self._lib, err) if err else "sg_engine_reload_policy failed"
+            raise PolicyRejected(message)
+        return json.loads(_take_string(self._lib, out))
 
     def runtime(self, workspace: str | os.PathLike[str] | None = None) -> str:
         """The execution runtime: 'local', 'vz', 'firecracker', 'gvisor'."""
@@ -524,6 +602,15 @@ class SandboxEngine:
                     # silently runs commands with no log, when a log was asked for.
                     self._lib.sg_engine_free(ctypes.c_void_p(handle))
                     raise SandboxError(message)
+
+            if self._policy_text is not None:
+                try:
+                    # Already vetted when it was first accepted; this only
+                    # brings a new handle up to the state the others are in.
+                    self._reload_one(handle, self._policy_text, RELOAD_ALLOW_WEAKENING)
+                except PolicyRejected:
+                    self._lib.sg_engine_free(ctypes.c_void_p(handle))
+                    raise
 
             self._engines[workspace] = handle
             return handle

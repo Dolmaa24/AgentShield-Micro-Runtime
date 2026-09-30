@@ -684,6 +684,9 @@ fn cmd_rules(o: &Opts) -> Result<ExitCode, String> {
     let gate = build_gate(o)?;
     let p = gate.policy();
     println!("{} rules, default verdict {}", p.rule_count(), p.default_verdict().as_str());
+    // The same identifier every decision and audit record carries, so a running
+    // engine can be matched to the file it was loaded from.
+    println!("policy {:016x}", p.fingerprint());
     println!(
         "{} prefilter patterns, {} rules evaluated on every command",
         p.prefilter_pattern_count(),

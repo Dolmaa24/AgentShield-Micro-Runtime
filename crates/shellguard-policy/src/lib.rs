@@ -18,7 +18,7 @@ mod model;
 mod text;
 
 pub use ac::{AhoCorasick, BitSet};
-pub use compile::{CompiledPolicy, Policy, Scratch};
+pub use compile::{CompiledPolicy, Policy, PolicyDiff, Scratch};
 pub use model::{ArgFacts, Capability, CommandFacts, Pred, Rule, RuleHit, Verdict};
 pub use text::{parse_policy, PolicyError};
 

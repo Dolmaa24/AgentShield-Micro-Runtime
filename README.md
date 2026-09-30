@@ -283,9 +283,38 @@ end
 Directives inside a rule are **and**-ed; multiple values on one directive are
 **or**-ed. Load your own with `--policy`.
 
-The parser refuses rules that would match every command, and rules with no
-`reason` — the most dangerous typo in a policy file is one that silently widens
-a rule.
+The parser refuses rules that would match every command, rules with no
+`reason`, and two rules with the same id — the most dangerous typo in a policy
+file is one that silently widens a rule, and a block pasted twice is how one
+gets in.
+
+### Changing rules in a running process
+
+A process that holds an engine open can swap its rules without restarting:
+
+```python
+engine.reload_policy(Path("policies/prod.policy").read_text())
+```
+
+```c
+char *report = sg_engine_reload_policy(engine, policy_text, 0, &err);
+```
+
+It takes the policy **text**, not a path, so you decide what was reviewed. It is
+atomic — a command is judged wholly by the old rules or wholly by the new — and
+a bad reload never displaces a good policy: the text is parsed in full first, and
+a malformed one is refused.
+
+A policy that *parses* can still be worse. A half-written save is a prefix of the
+file, and a prefix cut between two rules is a valid, smaller policy. So a reload
+that removes a restriction, lowers a verdict, or adds a rule more permissive than
+the default is refused unless you pass `allow_weakening=True`
+(`SG_RELOAD_ALLOW_WEAKENING`). Every decision carries a `policy` fingerprint, and
+every reload — applied or refused — is written to the audit log with the SHA-256
+of the text. See [DESIGN.md § 15](DESIGN.md#15-reloading-the-policy).
+
+The command-line tool reads its policy fresh on every invocation, so it has
+nothing to reload.
 
 ## Layout
 

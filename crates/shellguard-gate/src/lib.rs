@@ -30,6 +30,7 @@ mod config;
 mod decision;
 mod gate;
 mod normalize;
+mod reload;
 mod resolve;
 mod unwrap;
 
@@ -37,6 +38,7 @@ pub use config::GateConfig;
 pub use decision::{CommandSummary, Decision, Finding, Incomplete};
 pub use gate::{Gate, Worker, DEFAULT_DEADLINE};
 pub use normalize::{Arg, Cmd};
+pub use reload::{ReloadError, ReloadMode, ReloadReport};
 pub use resolve::{lexical_normalize, looks_like_path, PathCache, PathClass};
 pub use shellguard_policy::{Capability, Verdict};
 

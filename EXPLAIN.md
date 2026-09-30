@@ -196,7 +196,11 @@ Being straight about this, because the gaps are real:
   tamper with it, but it can be edited by another program running as you, and
   it only knows about commands that went through AgentShield.
 - **No memory or CPU limits** on what a command can consume.
-- **Rule changes need a restart** — no live reloading.
+- **Swapping rules in a running program is safe, but it isn't magic.** A program
+  that's already running can load new rules without restarting, all-or-nothing,
+  and a broken or half-saved rules file is refused. Rules that make things
+  *looser* are refused too unless you say you mean it. What it can't notice is a
+  rule that keeps its name and severity but quietly matches more.
 
 ---
 

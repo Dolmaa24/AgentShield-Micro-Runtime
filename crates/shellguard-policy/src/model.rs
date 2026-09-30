@@ -207,7 +207,7 @@ pub struct CommandFacts<'a> {
 /// The two-level structure is the whole ergonomics story: `arg-prefix -rf -fr`
 /// reads as "any of these", and stacking directives reads as "and". Rules that
 /// need real boolean structure use `Any`/`Not`, but almost none do.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Pred {
     /// Always true. For rules selected purely by program.
     Always,
@@ -347,7 +347,7 @@ impl Pred {
 }
 
 /// A single policy rule.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rule {
     pub id: String,
     pub verdict: Verdict,

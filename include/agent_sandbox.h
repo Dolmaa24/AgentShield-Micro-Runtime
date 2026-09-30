@@ -155,6 +155,31 @@ int sg_engine_set_audit(sg_engine *engine, const char *path, uint32_t flags,
  * failing is otherwise silent. */
 uint64_t sg_engine_audit_failures(const sg_engine *engine);
 
+/* Policy reload flag for sg_engine_reload_policy. */
+
+/* Accept a reload that lowers protection: removes a restriction, lowers a
+ * verdict, or adds a rule more permissive than the default. Off by default,
+ * because a policy file cut short by a failed write looks exactly like that. */
+#define SG_RELOAD_ALLOW_WEAKENING 1u
+
+/* Replace the ruleset of a running engine. Returns an owned JSON report for
+ * sg_string_free (fingerprints before/after, rules added/removed/modified, and
+ * anything weakened), or NULL with a message in err_out. In every NULL case the
+ * previous rules are still in force.
+ *
+ * Takes the policy TEXT, not a path, so the caller decides what was reviewed.
+ * The text is parsed and compiled in full before anything changes, so a
+ * malformed policy never displaces a good one. Atomic with respect to
+ * judgments: a command is judged wholly by the old rules or wholly by the new.
+ * Unknown flag bits are rejected. Safe to call while other threads are judging
+ * or executing on the same engine. */
+char *sg_engine_reload_policy(const sg_engine *engine, const char *policy_text,
+                              uint32_t flags, char **err_out);
+
+/* Identifies the ruleset in force; also the "policy" field (hex) on every
+ * decision. Zero for NULL. */
+uint64_t sg_engine_policy_fingerprint(const sg_engine *engine);
+
 /* Judge a command without running it. Returns owned JSON for sg_string_free,
  * or NULL if an argument was unusable. */
 char *sg_engine_eval_json(const sg_engine *engine, const char *command);

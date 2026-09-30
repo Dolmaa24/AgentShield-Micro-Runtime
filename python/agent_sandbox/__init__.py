@@ -16,6 +16,7 @@ from agent_sandbox.binding import (
     ExecutionResult,
     Finding,
     LibraryNotFound,
+    PolicyRejected,
     SandboxEngine,
     SandboxError,
     Verdict,
@@ -29,6 +30,7 @@ __all__ = [
     "Finding",
     "Verdict",
     "SandboxError",
+    "PolicyRejected",
     "LibraryNotFound",
     "find_library",
 ]
