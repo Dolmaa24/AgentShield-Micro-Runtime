@@ -123,8 +123,8 @@ impl Drop for Workspace {
 
 /// An engine whose gate has a generous deadline.
 ///
-/// The gate fails closed when it exceeds its 10 ms budget, which on a loaded
-/// machine turns an innocent command into a `deny` and a classification test
+/// The gate fails closed when it exceeds its deadline (100 ms by default), which
+/// on a loaded machine can turn an innocent command into a `deny` and a classification test
 /// into a coin flip. These tests are about *which* verdict the rules give, not
 /// how fast; latency is measured elsewhere.
 fn engine(ws: &Path) -> Engine {
@@ -520,6 +520,10 @@ fn hostnames_do_not_resolve_without_a_network_grant() {
 /// service. Success or refusal is unambiguous, and nothing is launched, opened or
 /// read — which is why this is the probe used, after `open -a NoSuchApp` proved
 /// useless: it resolves application names locally and answers the same either way.
+///
+/// The names are the two the profile grants (`libinfo` always, `TrustEvaluationAgent`
+/// with a network grant), `logd` and `configd` as services tools do ask for and the
+/// profile deliberately does not grant, and the four that act on the user's behalf.
 #[cfg(target_os = "macos")]
 const MACH_PROBE: &str = r#"
 import ctypes
@@ -527,34 +531,68 @@ libc = ctypes.CDLL(None)
 libc.bootstrap_look_up.argtypes = [ctypes.c_uint, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint)]
 libc.bootstrap_look_up.restype = ctypes.c_int
 bp = ctypes.c_uint.in_dll(libc, "bootstrap_port")
-for name in ["com.apple.logd", "com.apple.coreservices.launchservicesd", "com.apple.SecurityServer",
+for name in ["com.apple.system.opendirectoryd.libinfo", "com.apple.TrustEvaluationAgent",
+             "com.apple.logd", "com.apple.SystemConfiguration.configd",
+             "com.apple.coreservices.launchservicesd", "com.apple.SecurityServer",
              "com.apple.pasteboard.1", "com.apple.nsurlsessiond"]:
     port = ctypes.c_uint()
     kr = libc.bootstrap_look_up(bp, name.encode(), ctypes.byref(port))
     print("REACHABLE" if kr == 0 else "refused  ", name)
 "#;
 
-/// The system services a command with no network grant should not be able to talk to.
+/// The services that act on a client's behalf, which no profile may grant: open a
+/// URL or an application (LaunchServices), read the keychain (SecurityServer),
+/// read or write the clipboard (pasteboard), fetch URLs in the background
+/// (nsurlsessiond).
+#[cfg(target_os = "macos")]
+const ACT_ON_BEHALF: &[&str] = &[
+    "com.apple.coreservices.launchservicesd",
+    "com.apple.SecurityServer",
+    "com.apple.pasteboard.1",
+    "com.apple.nsurlsessiond",
+];
+
+/// Names the probe found reachable, from its output.
+#[cfg(target_os = "macos")]
+fn reachable(out: &str) -> std::collections::BTreeSet<String> {
+    out.lines().filter_map(|l| l.strip_prefix("REACHABLE ")).map(|n| n.trim().to_string()).collect()
+}
+
+/// A check that `reachable` is what the profile grants, and that the probe worked.
+#[cfg(target_os = "macos")]
+fn assert_reachable_is_exactly(out: &str, granted: &[&str], what: &str) {
+    let got = reachable(out);
+    let want: std::collections::BTreeSet<String> = granted.iter().map(|s| s.to_string()).collect();
+    // The harness must have worked, or "refused" would mean nothing: a probe that
+    // printed nothing would pass a test that asks for an empty set.
+    assert_eq!(
+        out.lines().filter(|l| l.starts_with("REACHABLE") || l.starts_with("refused")).count(),
+        8,
+        "the probe did not report all 8 services: {out}"
+    );
+    for n in ACT_ON_BEHALF {
+        assert!(
+            !got.contains(*n),
+            "{what}: reachable {n}, which acts on the user's behalf:\n{out}"
+        );
+    }
+    assert_eq!(got, want, "{what}: reachable services differ from the granted set:\n{out}");
+}
+
+/// A command with no network grant may look up only the services in
+/// `MACH_SERVICES_BASE`.
 ///
-/// Each is a service outside the sandbox that will act on a client's behalf: open a
-/// URL or an application (LaunchServices), read the keychain (SecurityServer), read
-/// or write the clipboard (pasteboard), fetch URLs in the background
-/// (nsurlsessiond). The Seatbelt profile allows *every* `mach-lookup`, so all four
-/// are reachable — measured, not assumed.
+/// This was a known gap (an `#[ignore]`d test) while the Seatbelt profile allowed
+/// *every* `mach-lookup`: all four services that act on the user's behalf were
+/// reachable, measured. It is now an allowlist, and this states what the allowlist
+/// means to the kernel rather than to the SBPL text.
 ///
-/// Reachable is not the same as exploitable, and this project has NOT tested whether
-/// any of them can be made to leak: doing so means opening URLs and reading a
-/// clipboard and keychain on the developer's machine. What is known is that
-/// sockets, and DNS through the system resolver, are refused (the tests above), so
-/// these services are the remaining route, and an allowlist of the services tools
-/// actually need is the fix. Denying LaunchServices alone was tried and breaks
-/// `git`, `python3`, `perl` and `curl`.
-///
-/// Ignored because it fails today. It states the property we want and is ready to be
-/// switched on when the allowlist lands.
+/// Reachable is not the same as exploitable, and this project has NOT tested
+/// whether any of them could be made to leak — doing so means opening URLs and
+/// reading a clipboard and keychain on the developer's machine. The property is
+/// the cheaper, stronger one: they cannot be asked at all.
 #[cfg(target_os = "macos")]
 #[test]
-#[ignore = "KNOWN GAP: the Seatbelt profile allows every mach-lookup; see DESIGN.md 16"]
 fn privileged_system_services_are_not_reachable_from_the_sandbox() {
     let sb = Workspace::new("mach");
     let ws = sb.ws();
@@ -564,19 +602,69 @@ fn privileged_system_services_are_not_reachable_from_the_sandbox() {
     let out =
         String::from_utf8_lossy(&run.exec.expect("the probe did not run").stdout).into_owned();
 
-    // The harness must have worked, or "refused" would mean nothing. `logd` is
-    // something every process legitimately reaches.
-    assert!(out.contains("REACHABLE com.apple.logd"), "the probe produced no usable output: {out}");
+    assert_reachable_is_exactly(
+        &out,
+        shellguard_enforce::macos::MACH_SERVICES_BASE,
+        "no network grant",
+    );
+}
 
-    let reachable: Vec<&str> = out
-        .lines()
-        .filter(|l| l.starts_with("REACHABLE"))
-        .filter(|l| !l.contains("com.apple.logd"))
-        .collect();
-    assert!(
-        reachable.is_empty(),
-        "a sandboxed command with no network grant can reach services that act on its behalf:\n{}",
-        reachable.join("\n")
+/// A network grant adds the certificate-trust service, and still not the four.
+///
+/// Granting network must not be a way to reach the keychain or the clipboard:
+/// the two grants are independent, and this is the test that says so.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_network_grant_does_not_open_the_services_that_act_on_the_users_behalf() {
+    let sb = Workspace::new("machnet");
+    let ws = sb.ws();
+    std::fs::write(ws.join("machprobe.py"), MACH_PROBE).unwrap();
+
+    let mut profile = Profile::locked_down(&ws).with_private_tmp(ws.join("tmp"));
+    std::fs::create_dir_all(ws.join("tmp")).unwrap();
+    profile.write_paths.push(ws.clone());
+    profile.allow_network = true;
+
+    let res = LocalRuntime::new()
+        .execute(
+            &Payload::new("python3 machprobe.py", &ws, profile)
+                .with_timeout(Duration::from_secs(15)),
+        )
+        .expect("runtime");
+    let out = String::from_utf8_lossy(&res.stdout).into_owned();
+
+    let mut granted: Vec<&str> = shellguard_enforce::macos::MACH_SERVICES_BASE.to_vec();
+    granted.extend_from_slice(shellguard_enforce::macos::MACH_SERVICES_NETWORK);
+    assert_reachable_is_exactly(&out, &granted, "network grant");
+}
+
+/// The other half of the network allowlist: with the grant, TLS verification
+/// actually works, so the trust service is there for a reason and not by habit.
+///
+/// Ignored because it needs the internet and a third party's server to be up;
+/// run it with `--ignored` after touching the network services.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs internet access; run with --ignored after changing MACH_SERVICES_NETWORK"]
+fn a_network_grant_is_enough_to_complete_a_tls_handshake_and_verify_it() {
+    let sb = Workspace::new("tls");
+    let ws = sb.ws();
+    let mut profile = Profile::locked_down(&ws).with_private_tmp(ws.join("tmp"));
+    std::fs::create_dir_all(ws.join("tmp")).unwrap();
+    profile.write_paths.push(ws.clone());
+    profile.allow_network = true;
+
+    let cmd = "python3 -c \"import urllib.request; \
+               print(urllib.request.urlopen('https://example.com', timeout=15).status)\"";
+    let res = LocalRuntime::new()
+        .execute(&Payload::new(cmd, &ws, profile).with_timeout(Duration::from_secs(30)))
+        .expect("runtime");
+    assert_eq!(
+        String::from_utf8_lossy(&res.stdout).trim(),
+        "200",
+        "exit {:?}, stderr: {}",
+        res.exit_code,
+        String::from_utf8_lossy(&res.stderr)
     );
 }
 

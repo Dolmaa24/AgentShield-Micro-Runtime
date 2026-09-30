@@ -78,6 +78,88 @@ const BASE_DEVICES: &[&str] = &[
     "/dev/fd",
 ];
 
+/// Mach services every confined process may look up, whatever else it is granted.
+///
+/// A Mach service is a system daemon that acts on a client's behalf, so an
+/// unrestricted `mach-lookup` is a way out of the sandbox that has nothing to do
+/// with files or sockets: LaunchServices opens URLs and applications,
+/// SecurityServer fronts the keychain, `pasteboard.1` is the clipboard, and
+/// `nsurlsessiond` fetches URLs in the background. All four were measured
+/// reachable from the old profile; none of them is reachable from this one.
+///
+/// The list is the *minimum that the tools an agent actually runs need*, found
+/// by experiment rather than guessed: run a battery of 46 common tools (git, cc,
+/// make, python3, perl, tar, awk, ...) under a profile with the allowlist empty,
+/// read the sandbox's own denial log for the services each failing tool was
+/// refused, add them, and repeat until the battery behaves exactly as it did
+/// under the blanket allow. Then drop each entry in turn and keep only the ones
+/// whose removal breaks something. One service survived:
+///
+/// * `opendirectoryd.libinfo` — `getpwuid`, `getgrgid`, `getpwnam`. Anything that
+///   asks who it is or who owns a file: `id -un`, `ls -l`, `git commit`'s author
+///   fallback, `python3`'s `pwd` and `getpass`.
+///
+/// # When a tool breaks on some other macOS
+///
+/// The set was measured on one macOS release, and Apple moves which daemon
+/// answers which question. A tool that fails here and works unsandboxed has
+/// almost certainly been refused a service. The sandbox says which:
+///
+/// ```text
+/// log show --last 5m --predicate 'eventMessage CONTAINS "deny(1) mach-lookup"'
+/// ```
+///
+/// Decide whether that service is one a sandboxed command should be able to
+/// reach before adding it. The answer for the four above is no.
+pub const MACH_SERVICES_BASE: &[&str] = &["com.apple.system.opendirectoryd.libinfo"];
+
+/// Mach services added when the profile grants outbound network, and only then.
+///
+/// * `TrustEvaluationAgent` — certificate-chain evaluation. Without it a TLS
+///   handshake completes at the socket layer and then fails verification, so
+///   `urllib`, `requests` and anything else using the system trust store cannot
+///   reach an HTTPS host that the profile has explicitly been given access to.
+///
+/// `SystemConfiguration.configd` was also requested by the same tools and was
+/// left out on purpose: they ran correctly without it. What it provides is the
+/// system-wide proxy configuration, so a machine that reaches the network only
+/// through a proxy set in System Settings (rather than `HTTPS_PROXY`) will not
+/// have that proxy discovered inside the sandbox. If that is your situation it is
+/// the one to add, knowing it also exposes the network configuration (interfaces,
+/// DNS servers, Wi-Fi name) to the command.
+pub const MACH_SERVICES_NETWORK: &[&str] = &["com.apple.TrustEvaluationAgent"];
+
+/// The services a profile may look up: the base set, plus the network set when
+/// outbound network is granted.
+fn mach_services(p: &Profile) -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = MACH_SERVICES_BASE.to_vec();
+    if p.allow_network {
+        v.extend_from_slice(MACH_SERVICES_NETWORK);
+    }
+    v
+}
+
+/// The `mach-lookup` rule for a list of services, or nothing at all if the list
+/// is empty.
+///
+/// The empty case is not a detail. In SBPL `(allow mach-lookup)` with no filter
+/// means *every service*, and so does `(allow mach-lookup` followed by nothing —
+/// measured: with an empty block, `SecurityServer` is reachable. So an allowlist
+/// that ends up empty and is written out naively becomes the blanket allow it
+/// replaced. Emitting no rule leaves `(deny default)` to refuse everything, which
+/// is what an empty list means.
+fn mach_rule(services: &[&str]) -> Result<String, EnforceError> {
+    if services.is_empty() {
+        return Ok(String::new());
+    }
+    let mut s = String::from("(allow mach-lookup\n");
+    for name in services {
+        s.push_str(&format!("  (global-name {})\n", sbpl_string(name)?));
+    }
+    s.push_str(")\n");
+    Ok(s)
+}
+
 /// Quote a path as an SBPL string literal.
 ///
 /// This is a security boundary, not formatting. SBPL is s-expression source
@@ -128,7 +210,8 @@ pub fn profile_sbpl(p: &Profile) -> Result<String, EnforceError> {
     s.push_str("(version 1)\n");
     s.push_str("(deny default)\n");
     s.push_str("(allow sysctl-read)\n");
-    s.push_str("(allow mach-lookup)\n");
+    // An allowlist, never a bare `(allow mach-lookup)`: see MACH_SERVICES_BASE.
+    s.push_str(&mach_rule(&mach_services(&p))?);
     s.push_str("(allow file-read-metadata)\n");
     s.push_str("(allow signal (target self))\n");
 
@@ -311,6 +394,244 @@ mod tests {
         assert!(!sbpl.contains("network-outbound"));
         let p = Profile::from_capabilities(ws(), &[Capability::NetConnect]);
         assert!(profile_sbpl(&p).unwrap().contains("network-outbound"));
+    }
+
+    // ------------------------------------------------------------ mach services
+
+    /// The text of the `(allow mach-lookup ...)` block, or None if there is none.
+    fn mach_block(sbpl: &str) -> Option<String> {
+        let start = sbpl.find("(allow mach-lookup")?;
+        let rest = &sbpl[start..];
+        // The block closes with a lone `)` on its own line; `")\n` alone is only
+        // the end of an entry.
+        Some(rest[..rest.find("\n)\n")? + 2].to_string())
+    }
+
+    fn mach_names(sbpl: &str) -> Vec<String> {
+        mach_block(sbpl)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("(global-name \""))
+            .filter_map(|l| l.strip_suffix("\")"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn mach_lookup_is_an_allowlist_never_a_blanket_allow() {
+        for p in [
+            Profile::locked_down(ws()),
+            Profile::from_capabilities(ws(), &[Capability::FsWrite]),
+            Profile::from_capabilities(ws(), &[Capability::NetConnect]),
+        ] {
+            let sbpl = profile_sbpl(&p).unwrap();
+            // A bare `(allow mach-lookup)` — or any mach-lookup rule that is not
+            // scoped to a named service — lets a command talk to every daemon
+            // on the machine. Checked on lines because the SBPL is line-shaped.
+            assert!(
+                !sbpl.lines().any(|l| l.trim() == "(allow mach-lookup)"),
+                "blanket mach-lookup:\n{sbpl}"
+            );
+            let block = mach_block(&sbpl).expect("no mach-lookup rule at all");
+            assert!(block.contains("(global-name \""), "rule names no service:\n{block}");
+            assert!(!block.contains("regex"), "a regex service match is a blanket in disguise");
+            assert_eq!(sbpl.matches("mach-lookup").count(), 1, "more than one mach rule:\n{sbpl}");
+        }
+    }
+
+    #[test]
+    fn an_empty_allowlist_emits_no_rule_because_an_empty_rule_allows_everything() {
+        // `(allow mach-lookup` with no filter is the blanket allow (verified
+        // against the kernel: SecurityServer is reachable through it). So the
+        // generator must write nothing for an empty list, not an empty block.
+        assert_eq!(mach_rule(&[]).unwrap(), "");
+        let one = mach_rule(&["com.example.a"]).unwrap();
+        assert_eq!(one, "(allow mach-lookup\n  (global-name \"com.example.a\")\n)\n");
+        // Names go through the string escaper like every other SBPL literal.
+        let hostile = mach_rule(&["x\") (allow default) (\""]).unwrap();
+        assert!(!hostile.lines().any(|l| l.trim() == "(allow default)"), "{hostile}");
+        assert!(mach_rule(&["bad\nname"]).is_err());
+    }
+
+    #[test]
+    fn the_offline_profile_gets_the_base_services_and_nothing_else() {
+        let sbpl = profile_sbpl(&Profile::from_capabilities(ws(), &[Capability::FsWrite])).unwrap();
+        assert_eq!(mach_names(&sbpl), MACH_SERVICES_BASE);
+        for n in MACH_SERVICES_NETWORK {
+            assert!(!sbpl.contains(n), "{n} is granted without a network grant");
+        }
+    }
+
+    #[test]
+    fn a_network_grant_adds_exactly_the_network_services() {
+        let sbpl =
+            profile_sbpl(&Profile::from_capabilities(ws(), &[Capability::NetConnect])).unwrap();
+        let mut want: Vec<&str> = MACH_SERVICES_BASE.to_vec();
+        want.extend_from_slice(MACH_SERVICES_NETWORK);
+        assert_eq!(mach_names(&sbpl), want);
+    }
+
+    #[test]
+    fn the_services_that_act_on_the_users_behalf_are_in_no_allowlist() {
+        // The reason the allowlist exists. If one of these is ever added because
+        // a tool needed it, this fails and the reason has to be written down here
+        // — it is a decision about what a sandboxed command can make the system
+        // do for it, not a compatibility patch.
+        let forbidden = [
+            "launchservices",            // open a URL or an application
+            "SecurityServer",            // the keychain
+            "securityd",                 // ditto
+            "pasteboard",                // the clipboard
+            "nsurlsessiond",             // background URL fetches
+            "pboard",                    // older clipboard name
+            "usernoted",                 // post notifications
+            "distributed_notifications", // broadcast to every app
+        ];
+        for n in MACH_SERVICES_BASE.iter().chain(MACH_SERVICES_NETWORK) {
+            for f in forbidden {
+                assert!(
+                    !n.to_lowercase().contains(&f.to_lowercase()),
+                    "{n} matches `{f}`: a sandboxed command would be able to make the system act for it"
+                );
+            }
+        }
+        // Names are SBPL string literals and go through the same escaping.
+        for n in MACH_SERVICES_BASE.iter().chain(MACH_SERVICES_NETWORK) {
+            assert_eq!(sbpl_string(n).unwrap(), format!("\"{n}\""), "{n} needs escaping");
+        }
+    }
+
+    // A tool an agent runs, and the fixture it runs against. `script` is run by
+    // `/bin/sh` inside `dir`, first with no sandbox (the control) and then under
+    // the profile; the two must agree on exit status and stdout.
+    const TOOLS: &[(&str, &str)] = &[
+        // Anything that asks who it is or who owns a file needs opendirectoryd.
+        // This is the entry whose removal from the allowlist breaks the most.
+        (
+            "ownership",
+            "id -un; ls -l a.txt | awk '{print $3}'; stat -f %Su a.txt; groups | wc -w | tr -d ' '",
+        ),
+        (
+            "python-user-database",
+            "python3 -c 'import pwd,grp,os,getpass; \
+             print(pwd.getpwuid(os.getuid()).pw_name, grp.getgrgid(os.getgid()).gr_name, getpass.getuser())'",
+        ),
+        (
+            "git",
+            "git -c user.email=a@b.c -c user.name=n -c init.defaultBranch=main init -q . \
+             && git add -A \
+             && git -c user.email=a@b.c -c user.name=n commit -qm one \
+             && echo two >> a.txt && git status --short && git diff --stat | tail -1 && git log --format=%s",
+        ),
+        ("cc", "cc hello.c -o hello && ./hello"),
+        ("make", "make"),
+        (
+            "archives",
+            "tar czf x.tgz a.txt && tar tzf x.tgz; gzip -c a.txt | gunzip | wc -l; \
+             zip -q x.zip a.txt && unzip -l x.zip | tail -1",
+        ),
+        (
+            "text-tools",
+            "grep -c foo a.txt; sort data.txt | uniq -c | wc -l; sed s/foo/bar/ a.txt | head -1; \
+             awk '{print $1}' a.txt | head -1; find . -name '*.txt' | sort | head -2",
+        ),
+        (
+            "interpreters",
+            "perl -e 'print 1+1, \"\\n\"'; node -e 'console.log(2+2)'; sqlite3 :memory: 'select 3'; \
+             bash -c 'echo b'; zsh -c 'echo z'",
+        ),
+        (
+            "python-runs-a-subprocess",
+            "python3 -c 'import subprocess; print(subprocess.run([\"ls\"],capture_output=True).stdout.decode().split())'",
+        ),
+        ("system-info", "uname -s; date +%Y >/dev/null; hostname >/dev/null; locale | head -1; xcrun --show-sdk-path >/dev/null; echo done"),
+    ];
+
+    fn reset_fixture(dir: &Path) {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir.join("tmp")).unwrap();
+        std::fs::write(dir.join("a.txt"), "foo one\nbar two\nfoo three\n").unwrap();
+        std::fs::write(dir.join("data.txt"), "x,1\ny,2\nx,3\n").unwrap();
+        std::fs::write(
+            dir.join("hello.c"),
+            "#include <stdio.h>\nint main(){puts(\"hello\");return 0;}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("Makefile"), "all:\n\t@echo built\n").unwrap();
+    }
+
+    fn tool_env(cmd: &mut Command, dir: &Path) {
+        cmd.current_dir(dir)
+            .env("HOME", dir)
+            .env("TMPDIR", dir.join("tmp"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("LC_ALL", "C");
+    }
+
+    /// (exit code, stdout) of `script`, unsandboxed or under `p`.
+    fn outcome(p: Option<&Profile>, dir: &Path, script: &str) -> (Option<i32>, String) {
+        reset_fixture(dir);
+        let mut c = match p {
+            None => {
+                let mut c = Command::new("/bin/sh");
+                c.args(["-c", script]);
+                c
+            }
+            Some(p) => {
+                let argv = command(p, "/bin/sh", &["-c", script]).unwrap();
+                let mut c = Command::new(&argv[0]);
+                c.args(&argv[1..]);
+                c
+            }
+        };
+        tool_env(&mut c, dir);
+        let out = c.output().expect("spawn");
+        (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    #[test]
+    fn ordinary_tools_behave_the_same_under_the_mach_allowlist_as_without_a_sandbox() {
+        // The allowlist is only acceptable if it costs nothing that people use.
+        // Each tool runs twice: with no sandbox, then under the profile. A tool
+        // that needs a service the allowlist withholds fails or prints something
+        // different, and the assertion names it.
+        //
+        // The control is what stops this being vacuous: a tool missing from this
+        // machine (no node, say) fails the same way both times and proves nothing,
+        // so those are skipped and counted, and the test wants most to have run.
+        let dir = ws().join("mach-tools");
+        let p = Profile::from_capabilities(ws(), &[Capability::FsWrite]);
+
+        let mut compared = Vec::new();
+        let mut skipped = Vec::new();
+        let mut broken = Vec::new();
+        for (name, script) in TOOLS {
+            let control = outcome(None, &dir, script);
+            if control.0 != Some(0) || control.1.trim().is_empty() {
+                skipped.push(*name);
+                continue;
+            }
+            let confined = outcome(Some(&p), &dir, script);
+            if confined != control {
+                broken.push(format!("{name}: control {control:?}, confined {confined:?}"));
+            } else {
+                compared.push(*name);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            broken.is_empty(),
+            "tools that work without a sandbox break under the mach allowlist \
+             (read the refused service from `log show`, see MACH_SERVICES_BASE):\n{}",
+            broken.join("\n")
+        );
+        assert!(
+            compared.len() >= 8,
+            "only {} tools could be compared ({compared:?}); skipped, control failed: {skipped:?}",
+            compared.len()
+        );
     }
 
     // ----------------------------------------------------- profile injection

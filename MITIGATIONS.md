@@ -352,7 +352,7 @@ embedders can make.
 ### 20. The irreducible risk: the gate can be wrong, a kernel bug is a full escape, rollback doesn't undo side effects
 
 **Status: the verification task is built and macOS is verified; the answer it gave
-is uncomfortable, and three fixes are decisions rather than code.** Design and
+is uncomfortable, and the two fixes that remain are decisions rather than code.** Design and
 evidence are in [DESIGN.md § 16](DESIGN.md#16-what-stops-a-command-from-sending-data-out).
 
 Built: `tests/exfiltration.txt` and its harness, with three classes (`blocked`,
@@ -371,8 +371,17 @@ was `allow`; `git remote add` was allowed as inspection; and Landlock denied
 | gap | why it is not just fixed |
 |---|---|
 | Linux: "no network" is TCP only; UDP and Unix sockets are open (read from code, never run) | the fix is a seccomp filter on `socket()`, a user+network namespace, or routing risky commands to gVisor. The first cannot be tested off-Linux; the second fails on hardened kernels |
-| macOS: `(allow mach-lookup)` leaves LaunchServices, the keychain server, the clipboard and the URL agent reachable | needs an allowlist of what tools really use; a naive deny of LaunchServices breaks `git`, `python3`, `perl`, `curl` |
 | `git branch -D`/`tag -d` are `allow`; the gate does not follow `cd` | need a policy-language predicate and a change to path tracking |
+
+**Closed since:** macOS `mach-lookup` is an allowlist, not a blanket allow. The
+keychain server, LaunchServices, the clipboard and the URL agent were reachable from a
+sandboxed command; none is now, in the offline profile or the network-granted one.
+The list (one service offline, one more with a network grant) was found by running 46
+tools and reading the sandbox's own refusals, then removing each entry to see which
+were needed. Tests ask the kernel which services are reachable, and a live-internet
+test shows the network entry is what makes HTTPS verify. Design and caveats — the list
+is per macOS release, and system-proxy discovery is off — are in
+[DESIGN.md § 6.1](DESIGN.md#61-macos-seatbelt-and-why-not-endpoint-security).
 
 **Decided and done:** the gate's deadline is now 100 ms, separate from the 10 ms
 latency budget it used to share a number with. See DESIGN.md § 5 and § 12 for the
