@@ -371,7 +371,15 @@ was `allow`; `git remote add` was allowed as inspection; and Landlock denied
 | gap | why it is not just fixed |
 |---|---|
 | Linux: "no network" is TCP only; UDP and Unix sockets are open (read from code, never run) | the fix is a seccomp filter on `socket()`, a user+network namespace, or routing risky commands to gVisor. The first cannot be tested off-Linux; the second fails on hardened kernels |
-| `git branch -D`/`tag -d` are `allow`; the gate does not follow `cd` | need a policy-language predicate and a change to path tracking |
+| the gate does not follow `cd` | needs a change to path tracking |
+
+**Closed since:** `git branch -D` and `git tag -d` were `allow` ("run directly"). Two
+predicates (`no-positional`, `flags-within`) let the policy allow a `branch` or `tag`
+only when every flag lists, and force/delete flags now `ask`. Git accepts abbreviated
+long options (`--del` deletes), which is why it is an allowlist. 98 commands are run
+against a real repository with the refs compared before and after
+([DESIGN.md § 12](DESIGN.md#12-known-limitations)). The same pass found
+`git log --output=<file>` writing files behind an `allow`, now `confine`.
 
 **Closed since:** macOS `mach-lookup` is an allowlist, not a blanket allow. The
 keychain server, LaunchServices, the clipboard and the URL agent were reachable from a

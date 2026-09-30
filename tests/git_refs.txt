@@ -1,0 +1,168 @@
+# `git branch` and `git tag`: what each command does to the refs, and the verdict
+# that follows from it.
+#
+# `allow` means "no rule objected, run it directly". For these two commands that
+# is a claim about git, not about the policy: that the command cannot change a
+# ref. The rules that say so are built on an allowlist of flags, and an allowlist
+# is only worth having if it is checked against the thing it describes. So every
+# line here is run for real, in a scratch repository, and the refs are compared
+# before and after:
+#
+#   readonly      git leaves every ref alone, and the gate says `allow`.
+#
+#   conservative  git leaves every ref alone, but the gate does NOT say `allow`
+#                 (it says `confine`). These are the cost of an allowlist: reads
+#                 the rules cannot prove are reads. Listed so the cost is a
+#                 number that can be looked at, and so that teaching the policy
+#                 one of them is a visible change.
+#
+#   mutates       git changes a ref, and the gate says `confine`: creating,
+#                 renaming or copying a branch or tag, or deleting one that git
+#                 itself checks is merged.
+#
+#   destroys      git changes a ref in a way that can discard commits or lose a
+#                 tag, and the gate says `ask`.
+#
+#   inert         git changes nothing - it lists, or refuses the combination -
+#                 but a flag that deletes or overwrites is present, so the gate
+#                 says `ask` anyway. Asking about the intent is the right answer
+#                 when the command was going to be wrong about it.
+#
+# The fixture (see git_refs.rs) has main at the newest commit and checked out,
+# `victim` at the oldest (merged), `other` in the middle, and tags v1 and v2 on
+# different commits, so that moving or deleting any of them is visible.
+#
+# A `mutates` or `destroys` line that leaves the refs unchanged fails: it would
+# mean the line proves nothing.
+
+# ---------------------------------------------------------------------------
+# Branches: reads
+# ---------------------------------------------------------------------------
+readonly	git branch
+readonly	git branch -a
+readonly	git branch -r
+readonly	git branch -v
+readonly	git branch -vv
+readonly	git branch -av
+readonly	git branch -i
+readonly	git branch --list
+readonly	git branch --list 'v*'
+readonly	git branch --list victim other
+readonly	git branch -l victim
+readonly	git branch -l 'vic*'
+readonly	git branch --show-current
+readonly	git branch --all --verbose
+readonly	git branch --remotes
+readonly	git branch --sort=-committerdate
+readonly	git branch --format='%(refname:short)'
+readonly	git branch --color=never
+readonly	git branch --no-color
+readonly	git branch --abbrev=8 -v
+readonly	git branch --contains=HEAD
+readonly	git branch --merged=main
+readonly	git branch --list --contains HEAD
+
+# Reads that take a commit as a separate word. The rules cannot tell the commit
+# from a branch name to create, so they do not allow it.
+conservative	git branch --contains HEAD
+conservative	git branch --no-contains HEAD
+conservative	git branch --merged main
+conservative	git branch --no-merged main
+conservative	git branch --points-at HEAD
+conservative	git branch -a --contains HEAD
+
+# git refuses these combinations, or lists and ignores the extra flag. The gate
+# does not allow them either, because a flag outside the read-only set is present.
+conservative	git branch -l -d victim
+conservative	git branch --list --delete victim
+conservative	git branch --list -m victim renamed
+conservative	git branch -a victim
+inert	git branch --list -D victim
+inert	git branch --show-current -D victim
+inert	git branch --list -f other main
+
+# ---------------------------------------------------------------------------
+# Branches: creating, renaming, copying, and deleting what git checks is merged
+# ---------------------------------------------------------------------------
+mutates	git branch feature
+mutates	git branch feature v1
+mutates	git branch feature other
+mutates	git branch -m victim renamed
+mutates	git branch --move victim renamed
+mutates	git branch -c victim copied
+mutates	git branch --copy victim copied
+mutates	git branch -d victim
+mutates	git branch --delete victim
+# Abbreviations of long options: git accepts any unambiguous prefix.
+mutates	git branch --del victim
+mutates	git branch --d victim
+mutates	git branch --mov victim renamed
+mutates	git branch --cop victim copied
+
+# ---------------------------------------------------------------------------
+# Branches: force. `-D` is --delete --force, `-M` is --move --force, `-C` is
+# --copy --force, and -f moves a branch that exists.
+# ---------------------------------------------------------------------------
+destroys	git branch -D victim
+destroys	git branch -D victim other
+destroys	git branch -M victim other
+destroys	git branch -C victim other
+destroys	git branch -f other main
+destroys	git branch -f victim main
+destroys	git branch --force other main
+destroys	git branch --forc other main
+destroys	git branch --delete --force victim
+destroys	git branch --del --force victim
+destroys	git branch -d -f victim
+destroys	git branch -df victim
+destroys	git branch -fd victim
+destroys	git branch --move --force victim other
+destroys	git branch --copy --force victim other
+
+# ---------------------------------------------------------------------------
+# Tags: reads
+# ---------------------------------------------------------------------------
+readonly	git tag
+readonly	git tag -l
+readonly	git tag --list
+readonly	git tag -l 'v*'
+readonly	git tag --list 'v*'
+readonly	git tag -n
+readonly	git tag -i -l V1
+readonly	git tag --sort=-creatordate
+readonly	git tag --format='%(refname:short)'
+readonly	git tag --contains=HEAD
+readonly	git tag --merged=main
+readonly	git tag -l --sort=-creatordate 'v*'
+
+conservative	git tag --contains HEAD
+conservative	git tag --points-at HEAD
+conservative	git tag --merged main
+conservative	git tag -n5
+conservative	git tag -a --list v1
+conservative	git tag -v v1
+inert	git tag -l -d v1
+inert	git tag --list --delete v1
+inert	git tag -l -f v2 main
+
+# ---------------------------------------------------------------------------
+# Tags: creating
+# ---------------------------------------------------------------------------
+mutates	git tag newtag
+mutates	git tag newtag other
+mutates	git tag -a annotated -m release
+mutates	git tag -m release annotated2
+
+# ---------------------------------------------------------------------------
+# Tags: deleting and moving. There is no merged-check to fall back on, and a tag
+# often marks a release. `--d` is the shortest abbreviation git accepts.
+# ---------------------------------------------------------------------------
+destroys	git tag -d v1
+destroys	git tag -d v1 v2
+destroys	git tag --delete v1
+destroys	git tag --del v1
+destroys	git tag --d v1
+destroys	git tag -f v1 main
+destroys	git tag --force v1 main
+destroys	git tag --forc v1 main
+destroys	git tag -fa v1 -m moved

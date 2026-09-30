@@ -227,6 +227,34 @@ confine	git remote update
 allow	git remote -v
 allow	git remote get-url origin
 
+# `git branch` and `git tag` list, create, rename and delete with the same word.
+# They are allowed only when every flag is one that lists; the full set, checked
+# against a real repository, is tests/git_refs.txt. Deleting or overwriting a
+# branch, and deleting or moving a tag, ask. Git accepts abbreviations of long
+# options, so `--del` is a delete.
+# `--output=<file>` makes diff, log, show and shortlog write that file.
+confine	git diff --output=out.patch
+confine	git log --output=../history.txt
+confine	git show --output=/etc/cron.d/x HEAD
+confine	git shortlog -s --output=authors.txt
+allow	git diff --stat
+allow	git log --oneline -5
+allow	git branch
+allow	git branch -vv
+allow	git branch --list 'feat/*'
+allow	git tag -l 'v*'
+confine	git branch feature
+confine	git branch -d feature
+confine	git branch --del feature
+confine	git tag v1.0
+ask	git branch -D main
+ask	git branch -M main
+ask	git branch --delete --force main
+ask	git branch -f main HEAD~3
+ask	git tag -d v1.0
+ask	git tag --del v1.0
+ask	git tag -f v1.0
+
 # A command with a substitution in its arguments is not one the allow rules
 # accept (they require resolved paths); the harmless command inside used to hide
 # that from the outer one.

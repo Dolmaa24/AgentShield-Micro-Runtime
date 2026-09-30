@@ -369,6 +369,38 @@ rule vcs.history-rewrite ask
   cap vcs.rewrite
 end
 
+# `-D` is `--delete --force`, `-M` is `--move --force`, `-C` is `--copy --force`,
+# and `-f` moves an existing branch to a new commit. All four discard the commits
+# that only the old branch reached. The ordinary `-d`, `-m`, `-c` refuse to
+# (git checks the branch is merged, or the target absent) and so are left to the
+# default. `--forc` catches `--force` and the abbreviation git also accepts;
+# shorter prefixes are ambiguous with `--format`, which git itself rejects.
+rule vcs.branch-force ask
+  reason forces a branch to be deleted, moved or overwritten, discarding commits that only it reached
+  program git
+  subcommand branch
+  any
+    short-flag D M C f
+    arg-prefix --forc
+  end-any
+  cap vcs.rewrite
+end
+
+# Deleting or moving a tag. Unlike `branch -d` there is no merged-check to fall
+# back on, and a tag often marks a release. `--d` is the shortest abbreviation git
+# accepts for `--delete`, and the only long option starting that way, so the
+# prefix catches all of them.
+rule vcs.tag-delete ask
+  reason deletes or moves a tag, which may mark a release
+  program git
+  subcommand tag
+  any
+    short-flag d f
+    arg-prefix --d --forc
+  end-any
+  cap vcs.rewrite
+end
+
 # git config keys whose values name a program. Setting one turns an ordinary
 # later `git` invocation into arbitrary execution, which makes this a delayed
 # shell escape rather than a configuration change.
@@ -516,15 +548,58 @@ end
 # `rename`) and reaches out over the network (`update`, `prune`). Those words as
 # arguments take the rule out of play, so they fall to the policy default.
 #
-# `branch` and `tag` have the same shape and are NOT fixed here: `git branch
-# newname` and `git branch -D old` mutate, and telling them from `git branch
-# --list` needs a predicate for "no positional arguments" that the policy
-# language does not have yet.
+# `branch` and `tag` are not here. They have the same shape as `remote` but far
+# more ways to mutate: `git branch newname` creates, `-D`/`-M`/`-C`/`-f` destroy or
+# overwrite, and git accepts unambiguous abbreviations of long options, so
+# `git branch --del old` deletes. A list of the bad words is a list of the ones
+# someone thought of; they have their own rules below, built on an allowlist.
+#
+# `--output=<file>` on `diff`, `log`, `show` and `shortlog` writes the result to
+# that file, creating or overwriting it, with no shell redirect for the write
+# rules to see. Git rejects abbreviations of it, so the prefix is complete.
+# Without this, `git log --output=$HOME/.bashrc` was `allow`.
 rule safe.vcs-inspection allow
   reason read-only version control inspection
   program git
-  subcommand status log diff show branch remote describe rev-parse blame shortlog tag
+  subcommand status log diff show remote describe rev-parse blame shortlog
   not arg-eq add set-url remove rm rename prune update set-head set-branches
+  not arg-prefix --output
+  not write-redirect
+  cap fs.read
+end
+
+# Listing branches. Allowed only if EVERY flag is one that lists or formats, and
+# any bare name is a pattern to `--list` rather than a branch to create. So
+# `git branch`, `-a`, `-vv`, `--show-current`, `--list 'feat/*'` are allowed, and
+# `git branch feature`, `-d`, `--del`, `-m`, `-f`, `--set-upstream-to=x` are not:
+# they fall to the policy default, or to `vcs.branch-force` below.
+#
+# The cost, stated: `git branch --merged main` and `--contains <sha>` are reads
+# that take a commit as a separate word, so they are not allowed either. They are
+# `confine`d - run in the sandbox - rather than refused.
+rule safe.vcs-branch-listing allow
+  reason listing branches; every flag given is read-only and a bare name is only a pattern to --list
+  program git
+  subcommand branch
+  flags-within --list --all --remotes --verbose --show-current --ignore-case --color --no-color --column --no-column --abbrev --no-abbrev --contains --no-contains --merged --no-merged --points-at --sort --format --omit-empty -l -a -r -v -i
+  any
+    no-positional
+    arg-eq --list -l
+  end-any
+  not write-redirect
+  cap fs.read
+end
+
+# The same for tags. `-a` is not listed: for `tag` it means "annotate", not "all".
+rule safe.vcs-tag-listing allow
+  reason listing tags; every flag given is read-only and a bare name is only a pattern to --list
+  program git
+  subcommand tag
+  flags-within --list --ignore-case --column --no-column --contains --no-contains --merged --no-merged --points-at --sort --format --omit-empty -l -n -i
+  any
+    no-positional
+    arg-eq --list -l
+  end-any
   not write-redirect
   cap fs.read
 end

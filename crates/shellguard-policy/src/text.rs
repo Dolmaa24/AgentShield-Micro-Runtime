@@ -333,6 +333,24 @@ fn predicate(head: &str, args: &[String]) -> Result<Pred, String> {
                 args.first().ok_or_else(|| "`wrap-depth-at-least` needs a number".to_string())?;
             Pred::WrapDepthAtLeast(v.parse().map_err(|_| format!("bad depth `{v}`"))?)
         }
+        "no-positional" => none(Pred::NoPositional)?,
+        "flags-within" => {
+            need("at least one flag")?;
+            // Each entry is checked because a wrong one does not fail loudly: an
+            // entry that can never match just makes the rule quietly narrower,
+            // and `-vv` (which reads as a flag) would never match anything.
+            for a in args {
+                let long = a.strip_prefix("--").is_some_and(|n| !n.is_empty() && !n.contains('='));
+                let short = a.len() == 2 && a.starts_with('-') && !a.starts_with("--");
+                if !long && !short {
+                    return Err(format!(
+                        "`flags-within` entry `{a}` must be `--name` or a single `-x` \
+                         (a bundle like `-vv` is matched flag by flag)"
+                    ));
+                }
+            }
+            Pred::FlagsWithin(vals())
+        }
         other => return Err(format!("unknown directive `{other}`")),
     })
 }
@@ -441,6 +459,48 @@ end
         assert_eq!(r.caps, vec![Capability::FsDelete]);
         assert_eq!(r.preds.len(), 2);
         assert!(matches!(r.preds[0], Pred::ShortFlag(_)));
+    }
+
+    #[test]
+    fn no_positional_and_flags_within_parse() {
+        let src = format!(
+            "{MINIMAL}
+rule t allow
+  reason t
+  program git
+  subcommand branch
+  flags-within --list --sort -a -v
+  no-positional
+end
+"
+        );
+        let p = parse_ok(&src);
+        assert_eq!(
+            p.rules[0].preds[1],
+            Pred::FlagsWithin(vec!["--list".into(), "--sort".into(), "-a".into(), "-v".into()])
+        );
+        assert_eq!(p.rules[0].preds[2], Pred::NoPositional);
+    }
+
+    #[test]
+    fn a_flags_within_entry_that_could_never_match_is_refused_at_load() {
+        // A dead entry does not fail; it makes the rule quietly narrower, so the
+        // mistakes are refused where they are made.
+        for bad in ["-vv", "list", "-", "--", "--sort=x", "--"] {
+            let src = format!(
+                "{MINIMAL}\nrule t allow\n  reason t\n  program git\n  flags-within {bad}\nend\n"
+            );
+            let e = parse_err(&src);
+            assert!(e.contains("flags-within") && e.contains(bad), "`{bad}`: {e}");
+        }
+        let e = parse_err(&format!(
+            "{MINIMAL}\nrule t allow\n  reason t\n  program git\n  flags-within\nend\n"
+        ));
+        assert!(e.contains("needs at least one flag"), "{e}");
+        let e = parse_err(&format!(
+            "{MINIMAL}\nrule t allow\n  reason t\n  program git\n  no-positional x\nend\n"
+        ));
+        assert!(e.contains("takes no arguments"), "{e}");
     }
 
     #[test]

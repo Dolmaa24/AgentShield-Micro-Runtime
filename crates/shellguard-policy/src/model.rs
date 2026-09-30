@@ -156,6 +156,63 @@ impl<'a> ArgFacts<'a> {
     pub fn text(&self) -> &'a str {
         self.literal.unwrap_or(self.prefix)
     }
+
+    /// The argument is certainly a flag: it begins with `-` and is not the bare
+    /// `-` that means standard input. Decided from the leading literal run, so
+    /// `--sort=$X` is a flag even though its value is not known.
+    fn is_flag(&self) -> bool {
+        match self.literal {
+            Some(l) => l.starts_with('-') && l != "-",
+            None => self.prefix.starts_with('-'),
+        }
+    }
+
+    /// The argument starts with something the shell expands (`$X`, `*`, `$(...)`),
+    /// so nothing is known about its first character and it may become a flag —
+    /// `git branch --list $X` with `X=-D` is a deletion.
+    fn may_become_a_flag(&self) -> bool {
+        self.literal.is_none() && self.prefix.is_empty()
+    }
+
+    /// Whether this argument is acceptable to `flags-within`.
+    fn flag_is_within(&self, allowed: &[String]) -> bool {
+        if self.may_become_a_flag() {
+            return false;
+        }
+        if !self.is_flag() {
+            // A positional argument. Whether one is welcome is `no-positional`'s
+            // question, not this predicate's.
+            return true;
+        }
+        let text = self.text();
+        if let Some(long) = text.strip_prefix("--") {
+            // `--name` or `--name=value`. Without an `=` a tainted argument's name
+            // may continue past what is known (`--$X`), so it is refused. The
+            // bare `--` (end of options) has an empty name and is refused too.
+            let name = match long.split_once('=') {
+                Some((name, _)) => name,
+                None if self.literal.is_some() => long,
+                None => return false,
+            };
+            !name.is_empty() && allowed.iter().any(|a| a.strip_prefix("--") == Some(name))
+        } else {
+            // A bundle of short flags: every one must be allowed. `text` starts
+            // with the one-byte `-`, so slicing at 1 is on a boundary.
+            let bundle = &text[1..];
+            self.literal.is_some()
+                && !bundle.is_empty()
+                && bundle.chars().all(|c| allowed.iter().any(|a| short_flag_entry(a) == Some(c)))
+        }
+    }
+}
+
+/// The character of a `-x` entry in a `flags-within` list, if it is one.
+fn short_flag_entry(entry: &str) -> Option<char> {
+    let mut cs = entry.chars();
+    match (cs.next(), cs.next(), cs.next()) {
+        (Some('-'), Some(c), None) if c != '-' => Some(c),
+        _ => None,
+    }
 }
 
 /// A command, reduced to the properties rules ask about.
@@ -255,6 +312,24 @@ pub enum Pred {
     PipedFrom(Vec<String>),
     /// The command was reached by unwrapping at least this many wrappers.
     WrapDepthAtLeast(u8),
+    /// No argument is positional except the subcommand itself: everything given
+    /// is a flag. `git branch -a` has none; `git branch feature` has one. Only
+    /// meaningful alongside `subcommand`, which is what it makes room for.
+    ///
+    /// An argument that starts with an expansion counts as positional, because
+    /// nothing is known about it — the conservative reading for a predicate whose
+    /// job is to say "there is nothing here that could name a target".
+    NoPositional,
+    /// Every argument that is, or could become, a flag is one of these.
+    ///
+    /// Entries are `--name` (matches `--name` and `--name=value`) or `-x` (a
+    /// single short flag, matched inside bundles: `-vv` needs `-v`). It is an
+    /// *allowlist*, which is the point: `git branch` has a dozen flags that
+    /// delete, move, copy or overwrite, and git accepts unambiguous prefixes of
+    /// long options (`--del` deletes), so a list of what is bad is a list of what
+    /// was thought of. A flag not named here, an abbreviation, the `--`
+    /// terminator, and any argument that begins with an expansion all fail it.
+    FlagsWithin(Vec<String>),
     Not(Box<Pred>),
     Any(Vec<Pred>),
 }
@@ -306,6 +381,11 @@ impl Pred {
             Pred::PipesInto(vs) => f.downstream.iter().any(|d| vs.iter().any(|v| v == d)),
             Pred::PipedFrom(vs) => f.upstream.iter().any(|u| vs.iter().any(|v| v == u)),
             Pred::WrapDepthAtLeast(n) => f.wrap_depth >= *n,
+            Pred::NoPositional => {
+                let positional = f.args.iter().filter(|a| !a.is_flag()).count();
+                positional <= usize::from(f.subcommand.is_some())
+            }
+            Pred::FlagsWithin(allowed) => f.args.iter().all(|a| a.flag_is_within(allowed)),
             Pred::Not(inner) => !inner.matches(f),
             Pred::Any(preds) => preds.iter().any(|p| p.matches(f)),
         }
@@ -455,6 +535,116 @@ mod tests {
         assert!(Pred::Subcommand(vec!["reset".into()]).matches(&f));
         assert!(Pred::ArgAt(0, vec!["reset".into()]).matches(&f));
         assert!(!Pred::ArgAt(1, vec!["reset".into()]).matches(&f));
+    }
+
+    /// An argument whose value is not known, with the literal run it starts with.
+    fn unknown(prefix: &str) -> ArgFacts<'_> {
+        ArgFacts { literal: None, prefix, taint: Taint::Variable, ..Default::default() }
+    }
+
+    fn allowed(flags: &[&str]) -> Pred {
+        Pred::FlagsWithin(flags.iter().map(|s| s.to_string()).collect())
+    }
+
+    /// `git <sub> <args>`, judged by `p`.
+    fn git_matches(p: &Pred, sub: &str, rest: &[ArgFacts<'_>]) -> bool {
+        let mut args = vec![arg(sub)];
+        args.extend_from_slice(rest);
+        let f = CommandFacts { subcommand: Some(sub), ..facts("git", &args, "") };
+        p.matches(&f)
+    }
+
+    #[test]
+    fn no_positional_allows_only_the_subcommand() {
+        let p = Pred::NoPositional;
+        assert!(git_matches(&p, "branch", &[]));
+        assert!(git_matches(&p, "branch", &[arg("-a")]));
+        assert!(git_matches(&p, "branch", &[arg("--sort=-committerdate")]));
+        assert!(!git_matches(&p, "branch", &[arg("feature")]));
+        assert!(!git_matches(&p, "branch", &[arg("-a"), arg("feature")]));
+        // The bare `-` is standard input, a positional.
+        assert!(!git_matches(&p, "branch", &[arg("-")]));
+        // Nothing is known about an argument that starts with an expansion.
+        assert!(!git_matches(&p, "branch", &[unknown("")]));
+        // But a flag whose *value* is unknown is still a flag.
+        assert!(git_matches(&p, "branch", &[unknown("--format=")]));
+        // Without a subcommand there is nothing to make room for.
+        let args = [arg("-a")];
+        assert!(p.matches(&facts("ls", &args, "a")));
+        let args = [arg("dir")];
+        assert!(!p.matches(&facts("ls", &args, "")));
+    }
+
+    #[test]
+    fn flags_within_is_an_allowlist_of_exact_names() {
+        let p = allowed(&["--list", "--sort", "-a", "-v"]);
+        // Allowed, alone and bundled, with or without an attached value.
+        assert!(git_matches(&p, "branch", &[]));
+        assert!(git_matches(&p, "branch", &[arg("--list")]));
+        assert!(git_matches(&p, "branch", &[arg("--sort=-committerdate")]));
+        assert!(git_matches(&p, "branch", &[arg("-a")]));
+        assert!(git_matches(&p, "branch", &[arg("-av")]));
+        assert!(git_matches(&p, "branch", &[arg("-vv")]));
+        assert!(git_matches(&p, "branch", &[arg("-a"), arg("-v"), arg("--list")]));
+        // A positional is not this predicate's business.
+        assert!(git_matches(&p, "branch", &[arg("--list"), arg("feat*")]));
+        assert!(git_matches(&p, "branch", &[arg("-")]));
+    }
+
+    #[test]
+    fn flags_within_refuses_everything_not_named() {
+        let p = allowed(&["--list", "--sort", "-a", "-v"]);
+        for bad in [
+            "-D",       // not listed
+            "-aD",      // one bad flag spoils a bundle
+            "-Dv",      // ... wherever it sits
+            "--delete", // not listed
+            "--del",    // git accepts unambiguous abbreviations of long options
+            "--lis",    // ... including of the ones that *are* listed
+            "--listx",  // a longer name is a different flag
+            "--",       // end of options: what follows is not judged
+            "-n5",      // a digit is not a listed flag
+            "-a=1",     // '=' is not a flag character
+        ] {
+            assert!(!git_matches(&p, "branch", &[arg(bad)]), "`{bad}` should not be within");
+            assert!(
+                !git_matches(&p, "branch", &[arg("--list"), arg(bad)]),
+                "`{bad}` after an allowed flag should not be within"
+            );
+        }
+    }
+
+    #[test]
+    fn flags_within_refuses_what_may_become_a_flag() {
+        let p = allowed(&["--list", "--sort", "-a"]);
+        // `git branch --list $X` with X=-D deletes a branch; `*` may likewise
+        // expand to a file named `-D`. Both are an argument with no known start.
+        assert!(!git_matches(&p, "branch", &[arg("--list"), unknown("")]));
+        // A dash followed by an expansion is a flag of unknown spelling.
+        assert!(!git_matches(&p, "branch", &[unknown("-")]));
+        assert!(!git_matches(&p, "branch", &[unknown("-a")]));
+        // The name of a long flag that is cut off by an expansion is unknown.
+        assert!(!git_matches(&p, "branch", &[unknown("--list")]));
+        assert!(!git_matches(&p, "branch", &[unknown("--")]));
+        // A positional that *starts* with known text cannot become a flag.
+        assert!(git_matches(&p, "branch", &[arg("--list"), unknown("feat")]));
+        // A known flag with an unknown value is fine: the name is what matters.
+        assert!(git_matches(&p, "branch", &[unknown("--sort=")]));
+        assert!(!git_matches(&p, "branch", &[unknown("--delete=")]));
+    }
+
+    #[test]
+    fn a_flags_within_entry_is_read_as_a_short_flag_only_if_it_is_one() {
+        assert_eq!(short_flag_entry("-a"), Some('a'));
+        assert_eq!(short_flag_entry("-9"), Some('9'));
+        assert_eq!(short_flag_entry("--"), None);
+        assert_eq!(short_flag_entry("--a"), None);
+        assert_eq!(short_flag_entry("-"), None);
+        assert_eq!(short_flag_entry("-ab"), None);
+        assert_eq!(short_flag_entry("a"), None);
+        // ... so a long name can never be mistaken for a short flag.
+        let p = allowed(&["--list"]);
+        assert!(!git_matches(&p, "branch", &[arg("-l")]));
     }
 
     #[test]

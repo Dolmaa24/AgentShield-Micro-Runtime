@@ -756,10 +756,49 @@ reachable" is the property claimed, not "not exploitable", which was never teste
 because doing so means opening URLs and reading a clipboard and keychain on a real
 machine.
 
-**"Read-only" git rules that mutate.** `safe.vcs-inspection` allows `git branch`
-and `git tag` whatever their arguments, so `git branch -D main` and `git tag -d v1`
-are `allow`. `remote` was fixed (§ 16); these need a "no positional arguments"
-predicate the policy language does not have.
+**"Read-only" git rules that mutate — fixed for `branch`, `tag` and `--output`.**
+`safe.vcs-inspection` allowed `git branch` and `git tag` whatever their arguments,
+so `git branch -D main` and `git tag -d v1` were `allow` — "run directly", with no
+sandbox in a harness that uses the gate alone. Fixing `remote` (§ 16) had shown the
+shape of the problem: a subcommand that lists and mutates with the same word.
+
+*The fix is an allowlist, not a longer blocklist.* Two predicates were added to the
+policy language: `no-positional` (nothing given but flags) and `flags-within` (every
+flag is one of these). `branch` and `tag` each get a listing rule that allows a command
+only if all its flags list or format, and treats a bare name as a pattern only when
+`--list` is present; force and delete flags get `ask` rules, consistent with
+`reset --hard` and `clean -f`. An allowlist matters here for a reason found by
+running git rather than reading its manual: **git accepts unambiguous abbreviations
+of long options**, so `git branch --del x` and even `--d x` delete, and
+`git tag --d v1` too. A list of the words that delete is a list of the ones someone
+thought of. `flags-within` matches exact names, so an abbreviation is simply not
+allowed; the `ask` rules match the prefixes. An argument that begins with an
+expansion (`$X`, `*`, `$(...)`) fails `flags-within` outright, because `X=-D` makes
+`git branch --list $X` a deletion.
+
+*It is checked against git.* `tests/git_refs.txt` holds 98 commands in five classes
+(`readonly`, `conservative`, `mutates`, `destroys`, `inert`). Each is judged by the
+gate and then run in a scratch repository whose branches and tags sit on different
+commits, and the refs are compared before and after — so a `mutates` line that
+changes nothing fails, and a "read-only" flag that isn't read-only in git fails.
+Under the old rule 33 of the 98 lines got the wrong verdict.
+
+*The cost is stated:* reads that give a commit as a separate word — `git branch
+--merged main`, `--contains <sha>`, `--points-at`, `git tag -n5` — cannot be told from
+creating a branch of that name, so they are `confine` (run in the sandbox), not
+`allow`. They are the `conservative` lines, kept so the cost is countable. The
+severity choice — `ask` for `-D`/`-M`/`-C`/`-f` and for any tag delete or move — is a
+judgment, mirrored on `reset --hard`; it is one rule each in `default.policy`.
+
+*A second hole of the same class turned up doing this:* `--output=<file>` on `git diff`,
+`log`, `show` and `shortlog` writes (and overwrites) any path with no shell redirect
+for the write rules to see, and was `allow`. It is now excluded from the read-only
+rule; `git log --output=$HOME/.bashrc` is `confine`.
+
+*Not fixed:* the read-only rule still allows `git diff --no-index a b` and
+`git blame --contents <file>`, which read paths outside the repository, and
+`--ext-diff`/`--textconv`, which run programs named in git configuration. The last is
+covered only in that setting such a configuration is `ask` (`vcs.config-executes`).
 
 **The gate does not follow `cd`.** Relative paths resolve against a fixed working
 directory, so `cd / && rm -rf *` is judged like `rm -rf .` — a `confine`, not the
@@ -827,6 +866,10 @@ tests that found them.
 | a "did not run" assertion searched stdout for text the refusal message itself prints | the test failing on the wrong thing |
 | a multi-workspace test assumed two engine handles when handles are created lazily | the test failing |
 | a test built a C string containing NUL, which a C string cannot | the test failing to construct its input |
+| git accepts unambiguous abbreviations of long options: `git branch --del x` and `--d x` delete, so a rule listing `--delete` misses them | running git to find out what "read-only" meant, instead of reading its manual |
+| `git log`/`diff`/`show`/`shortlog --output=<file>` writes a file, and was `allow` under a rule called read-only inspection | checking the *other* subcommands of the rule I was fixing |
+| a spec line `--format=%(refname:short)` was an unquoted-parenthesis syntax error, so the gate correctly said `deny` and git errored too | the two halves of the test disagreeing about the same line |
+| a probe of `git shortlog` hung: it reads stdin when it is not a terminal | the background task never finishing |
 | an SBPL `(allow mach-lookup` block with an empty filter list is the blanket allow, so an allowlist that came out empty would have silently become the rule it replaced | a mutation that emptied the list passed the real-tool test; asking the kernel showed `SecurityServer` reachable |
 | a helper that found the end of the `mach-lookup` block stopped at the first entry, so the "exactly these services" test passed vacuously for the one-entry profile | the same test failing for the two-entry (network) profile |
 
