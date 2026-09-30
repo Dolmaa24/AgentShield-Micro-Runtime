@@ -532,9 +532,38 @@ Landlock does not. gVisor implements the Linux syscall surface itself and does
 not implement `landlock_create_ruleset`; a ruleset built inside would fail at
 creation, and code that ignored that failure would believe it was confined when
 it was not. The filesystem scoping comes from the OCI mount set instead —
-read-only root, only the workspace mounted writable, `/proc` and `/sys` masked.
-The same effect by a different mechanism. Calling it Landlock would misdescribe
-the threat model.
+read-only root, `/proc` and `/sys` masked, and only the host paths the profile
+grants, each mounted `ro` or `rw` to match. A different mechanism aiming at the
+same effect. Calling it Landlock would misdescribe the threat model.
+
+**"The same effect" was asserted in this paragraph and checked nowhere, and it
+was false.** The mount set used to bind the workspace `rw` unconditionally, so a
+profile that granted no writes — `ls`, `git status`, anything the gate allowed
+on `fs.read` alone — got a *writable* workspace under gVisor while Seatbelt and
+Landlock made it read-only. A test named "only the workspace is writable" sat
+over it and asserted only that there was one bind mount, never `ro` versus `rw`.
+The extra `read_paths` and `write_paths` a profile can carry were ignored
+altogether, and `/tmp` was a writable tmpfs even when the profile had no scratch
+directory.
+
+**One list, three translations.** `Profile::fs_grants` is now the single place
+that answers "which host paths does this profile expose, and how far".
+Seatbelt, Landlock and the gVisor mount set each translate that list into their
+own mechanism and derive nothing themselves, so they can differ in *how* they
+enforce but not in *what*. The gVisor test suite (`tests::parity_*`) holds the
+translation to the list across every capability alone and combined, with and
+without a scratch directory, and for hand-built profiles with extra and nested
+paths: the container writes exactly the paths granted writes, reads exactly the
+paths granted reads, mounts nothing that was not granted, and never mounts the
+host's own `/usr` or `/etc`.
+
+Where the backends deliberately differ: Landlock reads the host's `/usr` and
+`/etc` directly, while a container's system files are the bundle's own root
+filesystem and the host's are never mounted. The private scratch directory is a
+tmpfs private to the container rather than a host directory — present only when
+the profile has one, since a profile without one has nowhere writable for temp
+files under the other two backends either. If two grants land on one guest path
+(possible only for a hand-built profile), the *lower* access wins.
 
 ## 9. Failing closed
 
@@ -649,6 +678,14 @@ occurrence explains itself.
 `max_memory_bytes` and on Linux nothing enforces them yet. Fork bombs are caught
 by a text rule, which is exactly as weak as it sounds.
 
+**gVisor/Landlock parity is by construction, and only half of it has run.** The
+gVisor side is exercised by the parity suite on any host. The Landlock side is a
+short loop over `Profile::fs_grants` that type-checks for x86_64 and aarch64
+Linux but has never run — there is no Linux host here — and the generated OCI
+bundle has never been given to `runsc`. Neither Seatbelt's nor Landlock's
+enforcement is compared against gVisor's *behaviour*, only against what each
+is told to allow.
+
 **Time-of-check to time-of-use in path classification.** The gate canonicalises
 the longest existing ancestor, which catches a symlinked parent. It cannot catch
 a symlink created between the decision and the command running. This is not a
@@ -687,6 +724,7 @@ tests that found them.
 | "stdout is not recorded" asserted against a string the command text itself contains, which is (correctly) recorded | the test failing on the wrong thing |
 | a tamper test that only let the gate refuse the command said nothing about the kernel | asking which layer had stopped it |
 | `shellguard run` silently ignored `--policy` while `eval` honoured it | reading `cmd_run` while designing reload |
+| gVisor mounted the workspace writable for a profile that granted no writes, under a test named "only the workspace is writable" that never checked `rw` against `ro` | writing the parity test first and watching it fail |
 | a policy block pasted twice was accepted by the parser and double-reported every match | a unit test, not the parser |
 | a "did not run" assertion searched stdout for text the refusal message itself prints | the test failing on the wrong thing |
 | a multi-workspace test assumed two engine handles when handles are created lazily | the test failing |

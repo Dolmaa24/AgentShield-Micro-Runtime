@@ -30,7 +30,7 @@
 use std::ffi::{c_char, c_int, CString};
 use std::path::Path;
 
-use crate::profile::{EnforceError, Profile};
+use crate::profile::{Access, EnforceError, Profile};
 
 /// Directories a process needs to read for `dyld` to load it at all.
 ///
@@ -152,17 +152,14 @@ pub fn profile_sbpl(p: &Profile) -> Result<String, EnforceError> {
     for d in BASE_DEVICES {
         s.push_str(&format!("  (literal {})\n", sbpl_string(d)?));
     }
-    s.push_str(&format!("  (subpath {})\n", path_string(&p.workspace)?));
-    for d in &p.read_paths {
-        s.push_str(&format!("  (subpath {})\n", path_string(d)?));
-    }
-    // Everything writable is also readable. A directory a command can write
-    // but not read back is nearly useless — `echo x > f; cat f` fails on the
-    // read — and Landlock's write rights are already a superset of its read
-    // rights, so granting them separately here would make the two platforms
-    // disagree about what the same profile means.
-    for d in p.writable() {
-        s.push_str(&format!("  (subpath {})\n", path_string(d)?));
+    // Every grant is readable, and a writable one is a grant too: a directory
+    // a command can write but not read back is nearly useless (`echo x > f;
+    // cat f` fails on the read). The list is `Profile::fs_grants`, shared with
+    // Landlock and the gVisor mount set, so the three cannot disagree about what
+    // the same profile means.
+    let grants = p.fs_grants();
+    for g in &grants {
+        s.push_str(&format!("  (subpath {})\n", path_string(&g.path)?));
     }
     s.push_str(")\n");
 
@@ -171,8 +168,8 @@ pub fn profile_sbpl(p: &Profile) -> Result<String, EnforceError> {
     s.push_str("(allow file-write*\n");
     s.push_str(&format!("  (literal {})\n", sbpl_string("/dev/null")?));
     s.push_str(&format!("  (literal {})\n", sbpl_string("/dev/tty")?));
-    for d in p.writable() {
-        s.push_str(&format!("  (subpath {})\n", path_string(d)?));
+    for g in grants.iter().filter(|g| g.access == Access::Write) {
+        s.push_str(&format!("  (subpath {})\n", path_string(&g.path)?));
     }
     s.push_str(")\n");
 

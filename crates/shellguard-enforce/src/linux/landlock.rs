@@ -27,7 +27,7 @@
 use std::ffi::{c_char, c_int, c_long, c_void, CString};
 use std::path::Path;
 
-use crate::profile::{EnforceError, Profile};
+use crate::profile::{Access, EnforceError, Profile};
 
 const SYS_LANDLOCK_CREATE_RULESET: c_long = 444;
 const SYS_LANDLOCK_ADD_RULE: c_long = 445;
@@ -223,13 +223,7 @@ pub fn build_ruleset(p: &Profile) -> Result<(c_int, u32), EnforceError> {
             // legitimately have no /lib64.
             let _ = add_path(ruleset_fd, Path::new(dir), READ_RIGHTS & handled_fs);
         }
-        add_path(ruleset_fd, &p.workspace, READ_RIGHTS & handled_fs)?;
-        for dir in &p.read_paths {
-            add_path(ruleset_fd, dir, READ_RIGHTS & handled_fs)?;
-        }
-        for dir in p.writable() {
-            add_path(ruleset_fd, dir, WRITE_RIGHTS & handled_fs)?;
-        }
+        add_grants(ruleset_fd, &p, handled_fs)?;
         Ok(())
     })();
 
@@ -300,13 +294,7 @@ pub fn apply(p: &Profile) -> Result<Applied, EnforceError> {
             // legitimately have no /lib64.
             let _ = add_path(ruleset_fd, Path::new(dir), READ_RIGHTS & handled_fs);
         }
-        add_path(ruleset_fd, &p.workspace, READ_RIGHTS & handled_fs)?;
-        for dir in &p.read_paths {
-            add_path(ruleset_fd, dir, READ_RIGHTS & handled_fs)?;
-        }
-        for dir in p.writable() {
-            add_path(ruleset_fd, dir, WRITE_RIGHTS & handled_fs)?;
-        }
+        add_grants(ruleset_fd, &p, handled_fs)?;
 
         super::seccomp::set_no_new_privs()?;
 
@@ -327,6 +315,23 @@ pub fn apply(p: &Profile) -> Result<Applied, EnforceError> {
     result?;
 
     Ok(Applied { abi, truncate_enforced: abi >= 3, network_enforced: abi >= 4 && handled_net != 0 })
+}
+
+/// Add every path the profile grants, at the rights its access level means.
+///
+/// The list comes from [`Profile::fs_grants`] and nothing is derived here, so
+/// this backend cannot come to disagree with Seatbelt or the gVisor mount set
+/// about what a profile allows. Only the base system directories — which are
+/// this backend's own business — are handled separately by the callers.
+fn add_grants(ruleset_fd: c_int, p: &Profile, handled_fs: u64) -> Result<(), EnforceError> {
+    for g in p.fs_grants() {
+        let rights = match g.access {
+            Access::Read => READ_RIGHTS,
+            Access::Write => WRITE_RIGHTS,
+        };
+        add_path(ruleset_fd, &g.path, rights & handled_fs)?;
+    }
+    Ok(())
 }
 
 fn add_path(ruleset_fd: c_int, path: &Path, rights: u64) -> Result<(), EnforceError> {
@@ -378,6 +383,16 @@ fn add_path(ruleset_fd: c_int, path: &Path, rights: u64) -> Result<(), EnforceEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_access_contains_read_access() {
+        // `Profile::fs_grants` promises this, and the other backends rely on it:
+        // a path a command can write is a path it can read back. Checked against
+        // the constants, so changing one without the other fails here.
+        assert_eq!(WRITE_RIGHTS & READ_RIGHTS, READ_RIGHTS);
+        assert_ne!(WRITE_RIGHTS, READ_RIGHTS, "Write must grant something Read does not");
+        assert_eq!(READ_RIGHTS & (FS_WRITE_FILE | FS_MAKE_REG | FS_REMOVE_FILE), 0);
+    }
 
     #[test]
     fn abi_gating_adds_rights_in_the_right_order() {

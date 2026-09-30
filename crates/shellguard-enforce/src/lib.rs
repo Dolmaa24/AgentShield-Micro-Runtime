@@ -40,7 +40,7 @@
 mod profile;
 mod syscalls;
 
-pub use profile::{EnforceError, Profile};
+pub use profile::{Access, EnforceError, FsGrant, Profile};
 pub use syscalls::DENIED as DENIED_SYSCALLS;
 
 #[cfg(target_os = "macos")]

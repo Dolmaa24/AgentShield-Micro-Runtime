@@ -59,6 +59,38 @@ anything.
 
 ### 3. Landlock does not survive into gVisor
 
+**Status: the parity half is built and verified; the other half is dropped, with
+a reason.** Design and findings are in
+[DESIGN.md § 8](DESIGN.md#on-gvisor-and-landlock-inside-the-container).
+
+**Built.** `Profile::fs_grants` is now the one place that decides which host
+paths a profile exposes and how far. Seatbelt, Landlock and the gVisor mount set
+each translate it and derive nothing of their own. Writing the parity test first
+and watching it fail showed the drift was real, not hypothetical: gVisor mounted
+the workspace `rw` for profiles granting no writes, ignored `read_paths` and
+`write_paths`, and offered a writable `/tmp` to profiles with no scratch
+directory. All three are fixed.
+
+**Dropped: Landlock on the `runsc` host process.** The original plan proposed
+confining the sentry itself. On reflection it cannot be built responsibly here:
+
+- `runsc` legitimately needs to create namespaces, mount, `pivot_root`, set up
+  cgroups and reach `/proc` and `/dev/kvm`. A Landlock ruleset around it has to
+  allow everything it touches, and I cannot enumerate that without running it.
+- Get it wrong and the failure is a launch path that never works, or — worse —
+  a ruleset loosened until it protects nothing while the docs claim it does.
+- gVisor documents that it already confines its own sentry and gofer with
+  namespaces and seccomp. I have not verified that here.
+
+Revisit with a Linux host, where `runsc` can be traced (`strace`) to see what a
+ruleset would have to allow. Until then this is recorded as a proposal, not a
+control.
+
+**What is still unverified**: the Landlock loop has never run (it type-checks for
+both Linux architectures), and no bundle has been given to `runsc`.
+
+The original plan for this entry follows, unchanged, for the record.
+
 **This one isn't fixable — `runsc` genuinely doesn't implement
 `landlock_create_ruleset`.** The honest move isn't a workaround that pretends
 otherwise; it's strengthening the compensating control that's already there

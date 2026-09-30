@@ -14,9 +14,21 @@
 //! a ruleset built inside a gVisor sandbox would fail at creation, and code
 //! that ignored that failure would believe it was confined when it was not.
 //! The filesystem scoping is achieved instead through the OCI mount set: the
-//! root is read-only, only the workspace is mounted writable, and `/proc` and
-//! `/sys` are masked. That is the same *effect* by a different mechanism, and
-//! calling it Landlock would misdescribe the threat model.
+//! root is read-only, `/proc` and `/sys` are masked, and the only host paths
+//! that appear are the ones [`Profile::fs_grants`] lists — each mounted `ro` or
+//! `rw` according to its [`Access`]. That is the same *effect* by a different
+//! mechanism, and calling it Landlock would misdescribe the threat model.
+//!
+//! "Same effect" is a claim that used to be made in this comment and checked
+//! nowhere, and it was false: the workspace was mounted writable for a profile
+//! that granted no writes, while Seatbelt and Landlock made it read-only. Seatbelt,
+//! Landlock and this mount set now all translate the one list `fs_grants`
+//! returns and derive nothing of their own, and `tests::parity_*` holds the
+//! translation to it.
+//!
+//! What is *not* the same, by design: the host's `/usr`, `/etc` and friends. Under
+//! Landlock they are readable directly; here the container's system files are the
+//! bundle's own root filesystem, and the host's are never mounted.
 //!
 //! gVisor's own interception is the stronger boundary in any case. Every
 //! syscall is serviced by the Sentry rather than the host kernel, so the host
@@ -28,6 +40,8 @@
 //! against the OCI schema.
 
 use std::path::{Path, PathBuf};
+
+use shellguard_enforce::{Access, Profile};
 
 use crate::json;
 use crate::runtime::{Availability, ExecResult, Isolation, Payload, Runtime, RuntimeError};
@@ -81,7 +95,45 @@ impl Default for GvisorRuntime {
     }
 }
 
+/// A host path mounted into the container.
+#[derive(Debug)]
+struct BindMount {
+    dest: PathBuf,
+    source: PathBuf,
+    access: Access,
+}
+
 impl GvisorRuntime {
+    /// The host paths to mount, from the profile's grants and nothing else.
+    ///
+    /// The workspace appears at [`guest_workspace`](Self::guest_workspace), and
+    /// anything granted beneath it appears beneath it there; other grants keep
+    /// their own absolute path. The private scratch directory is *not* bound: it
+    /// is represented by the container's own `/tmp` tmpfs, which is private to
+    /// the container and needs no host directory.
+    ///
+    /// Parents come before children, as a mount table requires. If two grants
+    /// land on one destination (only possible for a hand-built profile that
+    /// grants a host path equal to the guest workspace), the *lower* access
+    /// wins: failing closed for a path is better than failing open.
+    fn bind_mounts(&self, profile: &Profile) -> Vec<BindMount> {
+        let mut out: Vec<BindMount> = Vec::new();
+        for g in profile.fs_grants() {
+            if profile.tmp.as_deref() == Some(g.path.as_path()) {
+                continue;
+            }
+            let dest = match g.path.strip_prefix(&profile.workspace) {
+                Ok(rel) if rel.as_os_str().is_empty() => self.guest_workspace.clone(),
+                Ok(rel) => self.guest_workspace.join(rel),
+                Err(_) => g.path.clone(),
+            };
+            out.push(BindMount { dest, source: g.path, access: g.access });
+        }
+        out.sort_by(|a, b| a.dest.cmp(&b.dest).then(a.access.cmp(&b.access)));
+        out.dedup_by(|later, first| later.dest == first.dest);
+        out
+    }
+
     pub fn with_rootfs(mut self, rootfs: impl Into<PathBuf>) -> Self {
         self.rootfs = Some(rootfs.into());
         self
@@ -151,22 +203,36 @@ impl GvisorRuntime {
         s.push_str("\"hostname\":\"shellguard\",");
 
         // ---- mounts
+        //
+        // Only what the profile grants. `nosuid` and `nodev` on every bind, so a
+        // setuid binary or device node planted in a granted directory cannot be
+        // used from inside; `ro` unless the grant is a write.
+        let mut mounts: Vec<String> = vec![
+            "{\"destination\":\"/proc\",\"type\":\"proc\",\"source\":\"proc\"}".to_string(),
+            "{\"destination\":\"/dev\",\"type\":\"tmpfs\",\"source\":\"tmpfs\",\"options\":[\"nosuid\",\"strictatime\",\"mode=755\",\"size=65536k\"]}".to_string(),
+        ];
+        // The private scratch directory, as a tmpfs private to the container.
+        // Present only when the profile has one: under Seatbelt and Landlock a
+        // profile with no scratch directory has nowhere writable to put temp
+        // files, and inventing one here would be a writable path they lack.
+        if payload.profile.tmp.is_some() {
+            mounts.push(
+                "{\"destination\":\"/tmp\",\"type\":\"tmpfs\",\"source\":\"tmpfs\",\"options\":[\"nosuid\",\"nodev\",\"mode=1777\"]}".to_string(),
+            );
+        }
+        for b in self.bind_mounts(&payload.profile) {
+            let mode = match b.access {
+                Access::Read => "ro",
+                Access::Write => "rw",
+            };
+            mounts.push(format!(
+                "{{\"destination\":{},\"type\":\"bind\",\"source\":{},\"options\":[\"rbind\",\"{mode}\",\"nosuid\",\"nodev\"]}}",
+                json::quote(&b.dest.to_string_lossy()),
+                json::quote(&b.source.to_string_lossy()),
+            ));
+        }
         s.push_str("\"mounts\":[");
-        s.push_str("{\"destination\":\"/proc\",\"type\":\"proc\",\"source\":\"proc\"},");
-        s.push_str(
-            "{\"destination\":\"/dev\",\"type\":\"tmpfs\",\"source\":\"tmpfs\",\"options\":[\"nosuid\",\"strictatime\",\"mode=755\",\"size=65536k\"]},",
-        );
-        s.push_str(
-            "{\"destination\":\"/tmp\",\"type\":\"tmpfs\",\"source\":\"tmpfs\",\"options\":[\"nosuid\",\"nodev\",\"mode=1777\"]},",
-        );
-        // The workspace, and nothing else from the host. `nosuid` and `nodev`
-        // so a setuid binary or device node planted in the workspace cannot be
-        // used from inside.
-        s.push_str("{\"destination\":");
-        s.push_str(&json::quote(&ws));
-        s.push_str(",\"type\":\"bind\",\"source\":");
-        s.push_str(&json::quote(&payload.workspace.to_string_lossy()));
-        s.push_str(",\"options\":[\"rbind\",\"rw\",\"nosuid\",\"nodev\"]}");
+        s.push_str(&mounts.join(","));
         s.push_str("],");
 
         // ---- linux
@@ -311,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn the_root_is_read_only_and_only_the_workspace_is_writable() {
+    fn the_root_is_read_only_and_the_workspace_is_the_only_host_path_mounted() {
         let v = parsed(false);
         assert_eq!(
             v.get("root").and_then(|r| r.get("readonly")).and_then(json::Json::as_bool),
@@ -324,6 +390,18 @@ mod tests {
             .collect();
         assert_eq!(binds.len(), 1, "exactly one host path should be mounted in");
         assert_eq!(binds[0].get("source").and_then(json::Json::as_str), Some("/srv/agent/ws"));
+        // This profile is `locked_down`: it grants no writes. This test used to
+        // be named "only the workspace is writable" and never looked at `rw`
+        // versus `ro`, which is how the workspace came to be writable here while
+        // Seatbelt and Landlock made it read-only.
+        let opts_all: Vec<&str> = binds[0]
+            .get("options")
+            .and_then(json::Json::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(json::Json::as_str)
+            .collect();
+        assert!(opts_all.contains(&"ro") && !opts_all.contains(&"rw"), "{opts_all:?}");
         let opts: Vec<&str> = binds[0]
             .get("options")
             .and_then(json::Json::as_array)
@@ -449,5 +527,365 @@ mod tests {
         let a = GvisorRuntime::default().availability();
         assert!(!a.is_ready());
         assert!(a.reason().unwrap().contains("Linux") || a.reason().unwrap().contains("PATH"));
+    }
+
+    // ------------------------------------------------------- mount / profile
+
+    /// One `bind` mount, as the OCI config states it.
+    #[derive(Debug)]
+    struct Bind {
+        dest: String,
+        source: String,
+        opts: Vec<String>,
+    }
+
+    impl Bind {
+        fn writable(&self) -> bool {
+            self.opts.iter().any(|o| o == "rw") && !self.opts.iter().any(|o| o == "ro")
+        }
+    }
+
+    fn binds(config: &str) -> Vec<Bind> {
+        let v = json::parse(config).unwrap_or_else(|e| panic!("{e}\n{config}"));
+        v.get("mounts")
+            .and_then(json::Json::as_array)
+            .unwrap()
+            .iter()
+            .filter(|m| m.get("type").and_then(json::Json::as_str) == Some("bind"))
+            .map(|m| Bind {
+                dest: m.get("destination").and_then(json::Json::as_str).unwrap().to_string(),
+                source: m.get("source").and_then(json::Json::as_str).unwrap().to_string(),
+                opts: m
+                    .get("options")
+                    .and_then(json::Json::as_array)
+                    .unwrap()
+                    .iter()
+                    .filter_map(json::Json::as_str)
+                    .map(String::from)
+                    .collect(),
+            })
+            .collect()
+    }
+
+    fn config_for(profile: Profile) -> String {
+        let ws = PathBuf::from("/srv/agent/ws");
+        let payload = Payload::new("echo hi", ws, profile).with_timeout(Duration::from_secs(5));
+        GvisorRuntime::default().with_rootfs("/srv/rootfs").oci_config(&payload)
+    }
+
+    #[test]
+    fn a_read_only_profile_gets_a_read_only_workspace() {
+        // The workspace is readable and not writable under Landlock and
+        // Seatbelt when nothing granted a write. It must not be writable here.
+        let b = binds(&config_for(Profile::locked_down("/srv/agent/ws")));
+        assert_eq!(b.len(), 1);
+        assert!(!b[0].writable(), "a read-only profile got a writable workspace: {:?}", b[0]);
+        assert!(b[0].opts.iter().any(|o| o == "ro"), "{:?}", b[0]);
+    }
+
+    #[test]
+    fn a_profile_that_grants_writes_gets_a_writable_workspace() {
+        let p =
+            Profile::from_capabilities("/srv/agent/ws", &[shellguard_policy::Capability::FsWrite]);
+        let b = binds(&config_for(p));
+        assert_eq!(b.len(), 1);
+        assert!(b[0].writable(), "{:?}", b[0]);
+    }
+
+    // ---------------------------------------------------------------- parity
+
+    use shellguard_policy::Capability;
+    use std::collections::BTreeSet;
+
+    fn all_capabilities() -> Vec<Capability> {
+        use Capability::*;
+        let all = vec![
+            FsRead,
+            FsWrite,
+            FsDelete,
+            NetConnect,
+            NetListen,
+            ProcSpawn,
+            ProcSignal,
+            PrivEsc,
+            DeviceWrite,
+            KernelModule,
+            ShellEscape,
+            PackageInstall,
+            VcsHistoryRewrite,
+            CredentialAccess,
+            SandboxEscape,
+        ];
+        // A compile-time guard: a new capability makes this match non-exhaustive,
+        // so the parity run below cannot silently skip it.
+        for c in &all {
+            match c {
+                FsRead | FsWrite | FsDelete | NetConnect | NetListen | ProcSpawn | ProcSignal
+                | PrivEsc | DeviceWrite | KernelModule | ShellEscape | PackageInstall
+                | VcsHistoryRewrite | CredentialAccess | SandboxEscape => {}
+            }
+        }
+        all
+    }
+
+    /// A spread of profiles: nothing granted, each capability alone, all of them
+    /// together, each with and without a private scratch directory, and
+    /// hand-built ones with extra and nested paths.
+    fn profiles() -> Vec<(String, Profile)> {
+        const WS: &str = "/srv/agent/ws";
+        let mut v: Vec<(String, Profile)> = vec![("locked down".into(), Profile::locked_down(WS))];
+        for c in all_capabilities() {
+            v.push((format!("{c:?}"), Profile::from_capabilities(WS, &[c])));
+        }
+        v.push(("every capability".into(), Profile::from_capabilities(WS, &all_capabilities())));
+
+        let with_scratch: Vec<_> = v
+            .iter()
+            .map(|(n, p)| {
+                (format!("{n} + scratch"), p.clone().with_private_tmp("/var/scratch/exec-1"))
+            })
+            .collect();
+        v.extend(with_scratch);
+
+        let mut extra = Profile::locked_down(WS).with_private_tmp("/var/scratch/exec-2");
+        extra.read_paths = vec!["/data/reference".into(), "/srv/agent/ws/vendor".into()];
+        extra.write_paths = vec!["/data/cache".into(), "/srv/agent/ws/build/out".into()];
+        v.push(("extra read and write paths, some nested in the workspace".into(), extra));
+
+        let mut writable_ws = Profile::from_capabilities(WS, &[Capability::FsWrite]);
+        writable_ws.read_paths = vec!["/srv/agent/ws/docs".into(), "/opt/tools".into()];
+        v.push(("writable workspace + read-only extras".into(), writable_ws));
+        v
+    }
+
+    fn sources(binds: &[Bind], writable: bool) -> BTreeSet<String> {
+        binds.iter().filter(|b| b.writable() == writable).map(|b| b.source.clone()).collect()
+    }
+
+    fn granted(p: &Profile, access: Access) -> BTreeSet<String> {
+        p.fs_grants()
+            .into_iter()
+            .filter(|g| g.access == access && p.tmp.as_deref() != Some(g.path.as_path()))
+            .map(|g| g.path.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn parity_the_container_writes_exactly_what_the_profile_grants_writes_to() {
+        for (name, p) in profiles() {
+            let b = binds(&config_for(p.clone()));
+            assert_eq!(
+                sources(&b, true),
+                granted(&p, Access::Write),
+                "{name}: writable host paths differ from the profile's write grants"
+            );
+        }
+    }
+
+    #[test]
+    fn parity_the_container_reads_exactly_what_the_profile_grants_reads_to() {
+        for (name, p) in profiles() {
+            let b = binds(&config_for(p.clone()));
+            assert_eq!(
+                sources(&b, false),
+                granted(&p, Access::Read),
+                "{name}: read-only host paths differ from the profile's read grants"
+            );
+        }
+    }
+
+    #[test]
+    fn parity_no_host_path_appears_that_the_profile_did_not_grant() {
+        for (name, p) in profiles() {
+            let all_grants: BTreeSet<String> =
+                p.fs_grants().iter().map(|g| g.path.to_string_lossy().into_owned()).collect();
+            for b in binds(&config_for(p.clone())) {
+                assert!(
+                    all_grants.contains(&b.source),
+                    "{name}: {} is mounted but was never granted",
+                    b.source
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parity_the_hosts_own_system_directories_are_never_mounted() {
+        // Landlock reads the host's /usr and /etc directly. A container gets the
+        // bundle's root instead, and must not have the host's mounted over it.
+        for (name, p) in profiles() {
+            for b in binds(&config_for(p.clone())) {
+                for sys in [
+                    "/", "/usr", "/etc", "/bin", "/lib", "/lib64", "/sbin", "/proc", "/sys",
+                    "/dev", "/root", "/home",
+                ] {
+                    assert_ne!(
+                        b.source, sys,
+                        "{name}: the host's {sys} is mounted into the container"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parity_every_bind_is_nosuid_and_nodev() {
+        for (name, p) in profiles() {
+            for b in binds(&config_for(p.clone())) {
+                assert!(
+                    b.opts.iter().any(|o| o == "nosuid") && b.opts.iter().any(|o| o == "nodev"),
+                    "{name}: {b:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parity_every_bind_says_ro_or_rw_and_never_both_or_neither() {
+        for (name, p) in profiles() {
+            for b in binds(&config_for(p.clone())) {
+                let ro = b.opts.iter().any(|o| o == "ro");
+                let rw = b.opts.iter().any(|o| o == "rw");
+                assert!(ro ^ rw, "{name}: {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn parity_the_private_scratch_is_a_container_tmpfs_and_never_a_host_bind() {
+        for (name, p) in profiles() {
+            let cfg = config_for(p.clone());
+            let v = json::parse(&cfg).unwrap();
+            let mounts = v.get("mounts").and_then(json::Json::as_array).unwrap();
+            let tmpfs_at_tmp = mounts
+                .iter()
+                .filter(|m| {
+                    m.get("destination").and_then(json::Json::as_str) == Some("/tmp")
+                        && m.get("type").and_then(json::Json::as_str) == Some("tmpfs")
+                })
+                .count();
+            assert_eq!(tmpfs_at_tmp, usize::from(p.tmp.is_some()), "{name}");
+
+            if let Some(t) = &p.tmp {
+                let t = t.to_string_lossy();
+                assert!(
+                    binds(&cfg).iter().all(|b| b.source != t),
+                    "{name}: the host scratch directory was bound into the container"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parity_a_profile_with_no_scratch_directory_has_no_writable_temp_anywhere() {
+        // Seatbelt and Landlock give such a profile no writable temp location, so
+        // the container must not invent one.
+        let cfg = config_for(Profile::locked_down("/srv/agent/ws"));
+        let v = json::parse(&cfg).unwrap();
+        let mounts = v.get("mounts").and_then(json::Json::as_array).unwrap();
+        assert!(
+            !mounts
+                .iter()
+                .any(|m| m.get("destination").and_then(json::Json::as_str) == Some("/tmp")),
+            "a writable /tmp exists although the profile has no scratch directory"
+        );
+    }
+
+    #[test]
+    fn parity_network_is_denied_exactly_when_the_profile_denies_it() {
+        for (name, p) in profiles() {
+            let v = json::parse(&config_for(p.clone())).unwrap();
+            let has_netns = v
+                .get("linux")
+                .and_then(|l| l.get("namespaces"))
+                .and_then(json::Json::as_array)
+                .unwrap()
+                .iter()
+                .any(|n| n.get("type").and_then(json::Json::as_str) == Some("network"));
+            assert_eq!(has_netns, !p.allow_network, "{name}");
+        }
+    }
+
+    #[test]
+    fn parity_mounts_are_ordered_parents_first_with_no_destination_twice() {
+        for (name, p) in profiles() {
+            let b = binds(&config_for(p.clone()));
+            let dests: Vec<&str> = b.iter().map(|x| x.dest.as_str()).collect();
+            let unique: BTreeSet<&&str> = dests.iter().collect();
+            assert_eq!(
+                unique.len(),
+                dests.len(),
+                "{name}: a destination is mounted twice: {dests:?}"
+            );
+
+            for (i, d) in dests.iter().enumerate() {
+                for later in &dests[i + 1..] {
+                    assert!(
+                        !Path::new(d).starts_with(later),
+                        "{name}: {d} is mounted before its parent {later}: {dests:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parity_the_workspace_lands_at_the_guest_workspace_and_nested_grants_beneath_it() {
+        let mut p = Profile::locked_down("/srv/agent/ws");
+        p.write_paths.push("/srv/agent/ws/build/out".into());
+        p.read_paths.push("/srv/agent/ws/docs".into());
+        let b = binds(&config_for(p));
+        let by_src = |s: &str| {
+            b.iter().find(|x| x.source == s).unwrap_or_else(|| panic!("{s} not mounted: {b:?}"))
+        };
+
+        assert_eq!(by_src("/srv/agent/ws").dest, "/workspace");
+        assert_eq!(by_src("/srv/agent/ws/docs").dest, "/workspace/docs");
+        assert_eq!(by_src("/srv/agent/ws/build/out").dest, "/workspace/build/out");
+        assert!(by_src("/srv/agent/ws/build/out").writable());
+        assert!(!by_src("/srv/agent/ws/docs").writable());
+        assert!(
+            !by_src("/srv/agent/ws").writable(),
+            "a nested write grant must not make its parent writable"
+        );
+    }
+
+    #[test]
+    fn parity_grants_outside_the_workspace_keep_their_own_path() {
+        let mut p = Profile::locked_down("/srv/agent/ws");
+        p.read_paths.push("/data/reference".into());
+        p.write_paths.push("/data/cache".into());
+        let b = binds(&config_for(p));
+        let dest_of = |s: &str| b.iter().find(|x| x.source == s).unwrap().dest.clone();
+        assert_eq!(dest_of("/data/reference"), "/data/reference");
+        assert_eq!(dest_of("/data/cache"), "/data/cache");
+    }
+
+    #[test]
+    fn parity_a_destination_collision_resolves_to_the_lower_access() {
+        // A hand-built profile granting a host path equal to the guest workspace.
+        // Fail closed: the path keeps the access that lets it do less.
+        let mut p = Profile::locked_down("/srv/agent/ws");
+        p.write_paths.push("/workspace".into());
+        let b = binds(&config_for(p));
+        let at: Vec<_> = b.iter().filter(|x| x.dest == "/workspace").collect();
+        assert_eq!(at.len(), 1, "{b:?}");
+        assert!(!at[0].writable(), "a collision resolved towards more access: {:?}", at[0]);
+    }
+
+    #[test]
+    fn parity_the_guests_working_directory_and_home_are_the_workspace_mount() {
+        let v = json::parse(&config_for(Profile::locked_down("/srv/agent/ws"))).unwrap();
+        let process = v.get("process").unwrap();
+        assert_eq!(process.get("cwd").and_then(json::Json::as_str), Some("/workspace"));
+        let home = process
+            .get("env")
+            .and_then(json::Json::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(json::Json::as_str)
+            .find(|e| e.starts_with("HOME="))
+            .unwrap();
+        assert_eq!(home, "HOME=/workspace");
     }
 }

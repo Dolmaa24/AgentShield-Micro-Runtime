@@ -8,9 +8,30 @@
 //! never by narrowing an open one. A capability the ruleset did not grant is
 //! one nobody has to remember to remove.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use shellguard_policy::Capability;
+
+/// How much of a host path a confined command may use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Access {
+    /// Read, list and execute.
+    Read,
+    /// Everything [`Access::Read`] allows, and create, change and delete.
+    ///
+    /// A superset, deliberately: a directory a command can write but not read
+    /// back is nearly useless (`echo x > f; cat f` fails on the read), and
+    /// Landlock's write rights already contain its read rights.
+    Write,
+}
+
+/// One host path a confined command is given, and how far.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FsGrant {
+    pub path: PathBuf,
+    pub access: Access,
+}
 
 /// What a confined command may do.
 #[derive(Clone, Debug)]
@@ -126,6 +147,44 @@ impl Profile {
         v
     }
 
+    /// Every host path this profile exposes, and how far — the one place that
+    /// question is answered.
+    ///
+    /// Seatbelt, Landlock and the gVisor mount set each used to work this out
+    /// for themselves from the same fields, and three copies of a rule drift.
+    /// They did: gVisor mounted the workspace writable for a profile that
+    /// granted no writes, while the other two made it read-only. Now each
+    /// backend translates *this list* into its own mechanism and derives nothing
+    /// of its own, so they can differ in how they enforce but not in what.
+    ///
+    /// Beyond the platform's own runtime files (`/usr`, `/lib`, …), which are
+    /// each backend's business: for gVisor they are the container's root, not the
+    /// host's. The workspace is always readable; `write_paths` and the private
+    /// scratch directory are writable; a path granted both ways is writable.
+    ///
+    /// Returned in path order, so a parent precedes its children — which is the
+    /// order a mount table needs — and without duplicates. Paths are used as
+    /// given; a caller that needs the kernel's view calls
+    /// [`canonicalized`](Profile::canonicalized) first.
+    pub fn fs_grants(&self) -> Vec<FsGrant> {
+        fn grant<'a>(m: &mut BTreeMap<&'a Path, Access>, path: &'a Path, access: Access) {
+            m.entry(path).and_modify(|a| *a = (*a).max(access)).or_insert(access);
+        }
+
+        let mut by_path: BTreeMap<&Path, Access> = BTreeMap::new();
+        grant(&mut by_path, &self.workspace, Access::Read);
+        for p in &self.read_paths {
+            grant(&mut by_path, p, Access::Read);
+        }
+        for p in &self.write_paths {
+            grant(&mut by_path, p, Access::Write);
+        }
+        if let Some(t) = &self.tmp {
+            grant(&mut by_path, t, Access::Write);
+        }
+        by_path.into_iter().map(|(p, access)| FsGrant { path: p.to_path_buf(), access }).collect()
+    }
+
     /// Resolve every path in the profile through symlinks.
     ///
     /// Both backends match on the kernel's view of a path, so a profile
@@ -176,6 +235,68 @@ impl std::error::Error for EnforceError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn grants(p: &Profile) -> Vec<(String, Access)> {
+        p.fs_grants().into_iter().map(|g| (g.path.display().to_string(), g.access)).collect()
+    }
+
+    #[test]
+    fn a_locked_down_profile_can_only_read_its_workspace() {
+        assert_eq!(grants(&Profile::locked_down("/ws")), [("/ws".to_string(), Access::Read)]);
+    }
+
+    #[test]
+    fn granting_a_write_to_the_workspace_upgrades_it_and_does_not_duplicate_it() {
+        let p = Profile::from_capabilities("/ws", &[Capability::FsWrite]);
+        assert_eq!(grants(&p), [("/ws".to_string(), Access::Write)]);
+    }
+
+    #[test]
+    fn extra_read_and_write_paths_and_the_scratch_directory_are_all_listed() {
+        let mut p = Profile::locked_down("/ws").with_private_tmp("/scratch/x");
+        p.read_paths.push("/data/ro".into());
+        p.write_paths.push("/data/rw".into());
+        assert_eq!(
+            grants(&p),
+            [
+                ("/data/ro".to_string(), Access::Read),
+                ("/data/rw".to_string(), Access::Write),
+                ("/scratch/x".to_string(), Access::Write),
+                ("/ws".to_string(), Access::Read),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_path_granted_both_ways_is_writable_whichever_order_it_was_added() {
+        for order in [[Access::Read, Access::Write], [Access::Write, Access::Read]] {
+            let mut p = Profile::locked_down("/ws");
+            for a in order {
+                match a {
+                    Access::Read => p.read_paths.push("/shared".into()),
+                    Access::Write => p.write_paths.push("/shared".into()),
+                }
+            }
+            let g = grants(&p);
+            assert_eq!(g.iter().filter(|(path, _)| path == "/shared").count(), 1, "{g:?}");
+            assert!(g.contains(&("/shared".to_string(), Access::Write)), "{g:?}");
+        }
+    }
+
+    #[test]
+    fn a_parent_always_precedes_its_children() {
+        // The order a mount table needs, and the reason `Path` ordering is used.
+        let mut p = Profile::locked_down("/ws");
+        p.write_paths.push("/ws/build/out".into());
+        p.read_paths.push("/ws/build".into());
+        let order: Vec<_> = grants(&p).into_iter().map(|(path, _)| path).collect();
+        assert_eq!(order, ["/ws", "/ws/build", "/ws/build/out"]);
+    }
+
+    #[test]
+    fn write_is_ordered_above_read() {
+        assert!(Access::Write > Access::Read);
+    }
 
     #[test]
     fn a_locked_down_profile_grants_no_writes_and_no_network() {
