@@ -1,0 +1,104 @@
+# Programs that write where their arguments say: what the gate must see.
+#
+# Each line is `class<TAB>command`. `{OUT}` is a directory beside the workspace,
+# outside it. The classes:
+#
+#   ask       writes into {OUT}; the gate asks. Run for real in a scratch
+#             fixture, and {OUT} must change — so a line that writes nothing
+#             there, or writes somewhere else, fails.
+#
+#   truncate  empties a file in {OUT}; the gate denies. Run for real, and
+#             {OUT} must change.
+#
+#   inside    writes only inside the workspace; the gate does not ask or deny.
+#             Run for real, and {OUT} must NOT change.
+#
+#   system    writes into, or above, a path the operating system owns; the gate
+#             denies. Never run.
+#
+#   remote    writes to another machine, which is the network rules' business;
+#             the gate says no more than `confine`. Never run.
+#
+# The fixture's workspace holds a.txt, moveme.txt, inner.txt, src/f.txt, x.tar
+# (member.txt), x.zip (zmember.txt), a.patch (changes {OUT}/target.txt, -p0) and
+# inside.patch (changes inner.txt); {OUT} holds precious.txt and target.txt.
+
+# ---------------------------------------------------------------------------
+# Into a directory outside the workspace: ask.
+# ---------------------------------------------------------------------------
+ask	cp a.txt {OUT}/
+ask	cp a.txt {OUT}/copied.txt
+ask	cp -t {OUT} a.txt
+ask	cp -R src {OUT}/
+ask	mv moveme.txt {OUT}/
+ask	install -m 644 a.txt {OUT}/
+ask	install -d {OUT}/newdir
+ask	ln -s a.txt {OUT}/link
+ask	ditto src {OUT}/dittoed
+ask	rsync -a src/ {OUT}/synced/
+ask	rsync -a src/ {OUT}/synced2/ --exclude .git
+ask	tar -xf x.tar -C {OUT}
+ask	tar -xf x.tar --directory={OUT}
+ask	tar xf x.tar -C {OUT}
+ask	tar -czf {OUT}/made.tgz src
+ask	unzip -o x.zip -d {OUT}
+ask	tee {OUT}/teed.txt < a.txt
+ask	tee -a {OUT}/precious.txt < a.txt
+ask	patch -d {OUT} -p0 < a.patch
+# Where the destination is spelled relative to a `cd` out of the workspace.
+ask	cd {OUT} && cp ../ws/a.txt .
+ask	cd {OUT} && tar -xf ../ws/x.tar
+ask	cd {OUT} && unzip -o ../ws/x.zip
+ask	cd {OUT} && tee here.txt < ../ws/a.txt
+
+# ---------------------------------------------------------------------------
+# Emptying a file outside: deny, as `> file` outside is.
+# ---------------------------------------------------------------------------
+truncate	truncate -s 0 {OUT}/precious.txt
+truncate	cd {OUT} && truncate -s 0 precious.txt
+
+# ---------------------------------------------------------------------------
+# Only inside the workspace: unchanged.
+# ---------------------------------------------------------------------------
+inside	cp a.txt copy.txt
+inside	cp a.txt src/
+inside	cp -R src src2
+inside	mv moveme.txt src/
+inside	tar -xf x.tar
+inside	tar -xf x.tar -C src
+inside	tar -czf out.tgz src
+inside	tar -czf out.tgz -C {OUT} precious.txt
+inside	unzip -o x.zip
+inside	unzip -o x.zip -d src
+inside	tee t.txt < a.txt
+inside	truncate -s 0 a.txt
+inside	rsync -a src/ dst/
+inside	install -d newdir
+inside	ln -s a.txt alink
+inside	patch -p0 < inside.patch
+
+# ---------------------------------------------------------------------------
+# Into or above a path the system owns: deny. Never run.
+# ---------------------------------------------------------------------------
+system	tar -xf x.tar -C /
+system	tar -xzf x.tgz --directory=/etc
+system	cp tool /usr/local/bin/
+system	cp x /
+system	mv x /etc/
+system	install -m 755 x /usr/bin/
+system	rsync -a x/ /etc/
+system	unzip x.zip -d /Library/Foo
+system	tee /etc/hosts
+system	patch -d /etc -p0
+system	cd / && tar -xf ~/x.tar
+system	cd /etc && cp x .
+system	cd /usr/local && unzip ~/x.zip
+
+# ---------------------------------------------------------------------------
+# Another machine: not a local write. Never run.
+# ---------------------------------------------------------------------------
+remote	rsync -a src/ host:/tmp/
+remote	rsync -a src/ rsync://host/module/
+# From outside the workspace, where a remote name read as a local path would be
+# outside too.
+remote	cd /tmp && rsync -a ~/src/ host:/tmp/

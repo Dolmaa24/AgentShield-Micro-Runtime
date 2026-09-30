@@ -149,6 +149,11 @@ pub struct ArgFacts<'a> {
     pub outside_workspace: bool,
     /// The argument names a path but taint prevented resolving it.
     pub unresolved_path: bool,
+    /// The path as an absolute name, from each directory the shell may be in —
+    /// joined and `..`-collapsed, symlinks not followed. Filled only for a
+    /// program's write destinations, where `cd / && tar -x` must be seen to
+    /// extract into `/` although the text says `.`.
+    pub resolved: &'a [String],
 }
 
 impl<'a> ArgFacts<'a> {
@@ -232,6 +237,10 @@ pub struct CommandFacts<'a> {
     /// inspects argv is blind to exactly this, so redirection targets get their
     /// own facts and their own predicates rather than being quietly folded in.
     pub write_targets: &'a [ArgFacts<'a>],
+    /// Paths the *program* writes because its arguments name them: `cp`'s
+    /// destination, the directory `tar -x` extracts into, the files `truncate`
+    /// empties. The other half of `write_targets`, which the shell writes.
+    pub writes: &'a [ArgFacts<'a>],
     /// Names of `NAME=value` assignments attached to the command.
     pub assignments: &'a [&'a str],
     /// Short flags with bundles decomposed, so `-rf` contributes `r` and `f`.
@@ -305,6 +314,14 @@ pub enum Pred {
     WriteRedirectOutside,
     /// Some write-redirection target begins with one of these.
     WriteTargetPrefix(Vec<String>),
+    /// A path the program writes, named in its arguments, resolves outside the
+    /// workspace.
+    WritesOutside,
+    /// A path the program writes lies under one of these directories — or above
+    /// one: extracting into `/` can land files in `/etc/` as surely as
+    /// extracting into `/etc/`. Matched on the text as written, like
+    /// `write-target-prefix`; entries end in `/`.
+    WritesUnder(Vec<String>),
     /// The command carries an assignment with one of these names.
     Assigns(Vec<String>),
     /// Some path argument resolves outside the workspace.
@@ -386,6 +403,13 @@ impl Pred {
                 f.write_targets.iter().any(|t| vs.iter().any(|v| t.prefix.starts_with(v.as_str())))
             }
             Pred::Assigns(vs) => f.assignments.iter().any(|a| vs.iter().any(|v| v == a)),
+            Pred::WritesOutside => f.writes.iter().any(|w| w.outside_workspace),
+            Pred::WritesUnder(dirs) => f.writes.iter().any(|w| {
+                std::iter::once(w.text()).chain(w.resolved.iter().map(String::as_str)).any(|t| {
+                    let as_dir = if t.ends_with('/') { t.to_string() } else { format!("{t}/") };
+                    dirs.iter().any(|d| as_dir.starts_with(d.as_str()) || d.starts_with(&as_dir))
+                })
+            }),
             Pred::PathOutsideWorkspace => f.args.iter().any(|a| a.outside_workspace),
             Pred::UnresolvedPath => f.args.iter().any(|a| a.unresolved_path),
             Pred::AbsolutePathArg => f.args.iter().any(|a| a.absolute),
@@ -670,6 +694,28 @@ mod tests {
         let mut out = Vec::new();
         Pred::ArgContainsNoCase(vec!["core.pager".into()]).needles(&mut out);
         assert!(out.is_empty(), "a case-insensitive predicate must not become a byte needle");
+    }
+
+    #[test]
+    fn writes_under_matches_inside_and_above_a_directory() {
+        let p = Pred::WritesUnder(vec!["/etc/".into(), "/usr/".into(), "/var/db/".into()]);
+        let check = |dest: &str| {
+            let writes = [arg(dest)];
+            p.matches(&CommandFacts { writes: &writes, ..facts("cp", &[], "") })
+        };
+        for under in ["/etc/hosts", "/etc", "/etc/", "/usr/local/bin/", "/", "/var", "/var/db/x"] {
+            assert!(check(under), "{under} should count as a system path");
+        }
+        for not in ["/etcetera", "/var/tmp/x", "/tmp/x", "/Users/me/bin", "etc/hosts", "~/x"] {
+            assert!(!check(not), "{not} should not count as a system path");
+        }
+        // The resolved location counts as well as the text: `cd / && tar -x`
+        // writes `.`, which is `/`.
+        let writes = [ArgFacts { resolved: &["/".to_string()], ..arg(".") }];
+        assert!(p.matches(&CommandFacts { writes: &writes, ..facts("tar", &[], "") }));
+        // Nothing written, nothing matched.
+        assert!(!p.matches(&facts("cp", &[], "")));
+        assert!(!Pred::WritesOutside.matches(&facts("cp", &[], "")));
     }
 
     #[test]

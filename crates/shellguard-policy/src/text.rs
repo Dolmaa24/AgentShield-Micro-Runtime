@@ -324,6 +324,18 @@ fn predicate(head: &str, args: &[String]) -> Result<Pred, String> {
             Pred::Assigns(vals())
         }
         "path-outside-workspace" => none(Pred::PathOutsideWorkspace)?,
+        "writes-outside" => none(Pred::WritesOutside)?,
+        "writes-under" => {
+            need("at least one directory")?;
+            for a in args {
+                if !a.starts_with('/') || !a.ends_with('/') {
+                    return Err(format!(
+                        "`writes-under` entry `{a}` must be an absolute directory ending in `/`"
+                    ));
+                }
+            }
+            Pred::WritesUnder(vals())
+        }
         "unresolved-path" => none(Pred::UnresolvedPath)?,
         "absolute-path-arg" => none(Pred::AbsolutePathArg)?,
         "pipes-into" => {
@@ -506,6 +518,24 @@ end
         let e = parse_err(&format!(
             "{MINIMAL}\nrule t allow\n  reason t\n  program git\n  no-positional x\nend\n"
         ));
+        assert!(e.contains("takes no arguments"), "{e}");
+    }
+
+    #[test]
+    fn writes_under_takes_absolute_directories_only() {
+        let ok = format!("{MINIMAL}\nrule t deny\n  reason t\n  writes-under /etc/ /usr/\nend\n");
+        assert_eq!(
+            parse_ok(&ok).rules[0].preds[0],
+            Pred::WritesUnder(vec!["/etc/".into(), "/usr/".into()])
+        );
+        // Without the trailing `/`, `/etc` would also match `/etcetera`.
+        for bad in ["/etc", "etc/", "~/x/"] {
+            let src = format!("{MINIMAL}\nrule t deny\n  reason t\n  writes-under {bad}\nend\n");
+            let e = parse_err(&src);
+            assert!(e.contains("writes-under") && e.contains(bad), "`{bad}`: {e}");
+        }
+        let e =
+            parse_err(&format!("{MINIMAL}\nrule t deny\n  reason t\n  writes-outside x\nend\n"));
         assert!(e.contains("takes no arguments"), "{e}");
     }
 

@@ -29,6 +29,9 @@ pub struct Arg {
     pub outside_workspace: bool,
     /// Names a path, but taint made it impossible to say where it points.
     pub unresolved_path: bool,
+    /// Where it really is, from each directory the shell may be in. Only worked
+    /// out for write destinations.
+    pub resolved: Vec<String>,
 }
 
 /// One command, resolved and normalised.
@@ -40,6 +43,9 @@ pub struct Cmd {
     pub resolved: Option<String>,
     pub args: Vec<Arg>,
     pub write_targets: Vec<Arg>,
+    /// Paths the program writes because its arguments name them. See
+    /// [`crate::writes`].
+    pub writes: Vec<Arg>,
     pub assignments: Vec<String>,
     pub short_flags: String,
     pub subcommand: Option<String>,
@@ -606,6 +612,11 @@ impl<'a> Collector<'a> {
             cmd.args.push(arg);
         }
 
+        for d in crate::writes::destinations(cmd.program.as_deref().unwrap_or(""), &cmd.args) {
+            let w = self.write_destination(&d, &cmd.args);
+            cmd.writes.push(w);
+        }
+
         for r in &s.redirects {
             if !r.op.writes() {
                 continue;
@@ -622,6 +633,61 @@ impl<'a> Collector<'a> {
         }
 
         cmd
+    }
+
+    /// A program's write destination, placed. Always classified as a path,
+    /// whatever it looks like: `cp x build` writes `build`, a bare name.
+    fn write_destination(&mut self, d: &crate::writes::Dest, args: &[Arg]) -> Arg {
+        use crate::writes::Dest;
+        let text = match d {
+            Dest::Arg(i) => match &args[*i].literal {
+                Some(l) => l.clone(),
+                // `cp x "$OUT"`: where it goes is not known, and is not guessed.
+                None => return args[*i].clone(),
+            },
+            Dest::Text(t) => t.clone(),
+            Dest::Here => ".".to_string(),
+        };
+        let placed = self.classify_here(&text);
+        let resolved = self.resolve_here(&text);
+        Arg {
+            prefix: text.clone(),
+            literal: Some(text),
+            looks_like_path: true,
+            absolute: placed.absolute,
+            outside_workspace: placed.outside,
+            unresolved_path: placed.unresolved,
+            resolved,
+            ..Default::default()
+        }
+    }
+
+    /// `raw` as an absolute path spelled the way the shell would name it, from
+    /// each directory the shell may be in: joined and `..`-collapsed, symlinks
+    /// left alone. What `cd / && tar -x` needs — `.` from `/` is `/` — without
+    /// following `/home` on macOS into `/System/Volumes/Data/home`, which is the
+    /// writable data volume and not the system.
+    fn resolve_here(&mut self, raw: &str) -> Vec<String> {
+        let expanded = match (raw.strip_prefix('~'), &self.cfg.home) {
+            (Some(""), Some(h)) => h.clone(),
+            (Some(rest), Some(h)) if rest.starts_with('/') => h.join(&rest[1..]),
+            _ => PathBuf::from(raw),
+        };
+        let mut out: Vec<String> = Vec::new();
+        let mut add = |p: PathBuf| {
+            let s = crate::resolve::lexical_normalize(&p).to_string_lossy().into_owned();
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        };
+        if expanded.is_absolute() {
+            add(expanded);
+        } else if let Cwd::Known(dirs) = &self.dirs.pwd {
+            for d in dirs.iter() {
+                add(d.join(&expanded));
+            }
+        }
+        out
     }
 
     /// Whether every directory the shell may be in is inside the workspace.

@@ -34,6 +34,7 @@ mod normalize;
 mod reload;
 mod resolve;
 mod unwrap;
+mod writes;
 
 pub use config::GateConfig;
 pub use decision::{CommandSummary, Decision, Finding, Incomplete};

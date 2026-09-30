@@ -336,3 +336,24 @@ confine	git -C /tmp status
 confine	git --git-dir=/tmp/other/.git log
 confine	git diff --no-index /etc/passwd notes.txt
 allow	git -C src status
+
+# ---------------------------------------------------------------------------
+# Programs that write where their arguments say, not where a redirect does.
+# Mirrors the redirect rules, as decided: into (or above) a path the system owns
+# is refused, truncating outside is refused, any other write outside the
+# workspace asks. The full set, run against the real programs, is
+# tests/writes.txt. Each `deny` and `ask` below was `confine`.
+# ---------------------------------------------------------------------------
+deny	tar -xf x.tar -C /
+deny	cp tool /usr/local/bin/
+deny	mv x /etc/
+deny	cd / && tar -xf ~/x.tar
+deny	truncate -s 0 ~/notes
+ask	tar -xf x.tar -C ~/
+ask	unzip x.zip -d ~/.ssh
+ask	cp tool ~/bin/
+ask	rsync -a dist/ ~/deploy/
+ask	tee -a /tmp/shared.log
+confine	tar -xf x.tar
+confine	cp -R src build/
+confine	rsync -a dist/ host:/srv/

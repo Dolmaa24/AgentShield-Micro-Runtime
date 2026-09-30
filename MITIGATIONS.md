@@ -372,6 +372,13 @@ was `allow`; `git remote add` was allowed as inspection; and Landlock denied
 |---|---|
 | Linux: "no network" is TCP only; UDP and Unix sockets are open (read from code, never run) | the fix is a seccomp filter on `socket()`, a user+network namespace, or routing risky commands to gVisor. The first cannot be tested off-Linux; the second fails on hardened kernels |
 
+**Closed since:** programs that write where their arguments say — `tar -C`,
+`unzip -d`, `cp`/`mv`/`install`/`ln`/`rsync`/`ditto` destinations, `patch`, `tee`,
+`truncate` — were `confine` wherever they wrote. They now mirror the redirect
+rules, as decided: into or above a system path is refused, truncating outside is
+refused, any other write outside the workspace asks. Checked by running 40 of
+them against the real programs ([DESIGN.md § 18](DESIGN.md#18-where-a-program-writes)).
+
 **Closed since:** git's global options hid the subcommand from every git rule —
 `git -C dir reset --hard` and `git -c x=y clean -fdx` were `confine` — and `git -c`
 with a program-naming key, or any alias, ran a program with no rule seeing it.

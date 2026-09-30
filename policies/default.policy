@@ -221,6 +221,36 @@ rule destructive.write-system-path deny
   cap fs.write
 end
 
+# The same, for a program writing to a path it was given rather than the shell
+# writing on its behalf: the destination of cp, mv, install, ln, rsync and ditto;
+# the directory tar extracts into (-C, or where it runs) and the archive it
+# creates; unzip's -d; what patch changes; every file tee and truncate name.
+# These were `confine`, judged like a write inside the workspace.
+#
+# Decided to mirror the redirect rules: a path the system owns is refused,
+# truncating outside is refused because it destroys what was there, and any other
+# write outside the workspace is asked about, since `cp tool ~/bin/` is often
+# what the person wants. "Under" includes "above": extracting into `/` can land
+# files in /etc as surely as extracting into /etc.
+rule destructive.write-system-path-arg deny
+  reason writes into a path owned by the operating system
+  writes-under /etc/ /usr/ /bin/ /sbin/ /boot/ /System/ /Library/ /var/db/ /private/etc/
+  cap fs.write
+end
+
+rule destructive.truncate-arg-outside deny
+  reason truncates a file outside the workspace
+  program truncate gtruncate
+  writes-outside
+  cap fs.write
+end
+
+rule fs.write-arg-outside ask
+  reason writes to a path outside the workspace, where rollback cannot restore it
+  writes-outside
+  cap fs.write
+end
+
 rule perms.recursive-outside deny
   reason recursive ownership or permission change outside the workspace
   program chmod chown chgrp

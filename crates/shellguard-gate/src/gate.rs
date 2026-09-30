@@ -184,6 +184,7 @@ impl Gate {
             w.hits.clear();
             let args: Vec<ArgFacts<'_>> = cmd.args.iter().map(arg_facts).collect();
             let targets: Vec<ArgFacts<'_>> = cmd.write_targets.iter().map(arg_facts).collect();
+            let writes: Vec<ArgFacts<'_>> = cmd.writes.iter().map(arg_facts).collect();
             let assignments: Vec<&str> = cmd.assignments.iter().map(String::as_str).collect();
             let downstream: Vec<&str> = cmd.downstream.iter().map(String::as_str).collect();
             let upstream: Vec<&str> = cmd.upstream.iter().map(String::as_str).collect();
@@ -194,6 +195,7 @@ impl Gate {
                 subcommand: cmd.subcommand.as_deref(),
                 args: &args,
                 write_targets: &targets,
+                writes: &writes,
                 assignments: &assignments,
                 short_flags: &cmd.short_flags,
                 arg_taint: cmd.arg_taint,
@@ -325,6 +327,7 @@ fn arg_facts(a: &crate::normalize::Arg) -> ArgFacts<'_> {
         absolute: a.absolute,
         outside_workspace: a.outside_workspace,
         unresolved_path: a.unresolved_path,
+        resolved: &a.resolved,
     }
 }
 

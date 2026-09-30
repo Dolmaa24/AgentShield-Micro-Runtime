@@ -901,6 +901,9 @@ tests that found them.
 | `git -C dir reset --hard` and `git -c x=y clean -fdx` were `confine`: the value of a global option was taken for the subcommand, and a unit test asserted that as correct | trying `git -C` while scoping the program-level `-C` options |
 | `git config CORE.PAGER x` sets `core.pager`, and was `confine` while the lower-case spelling was `ask` | reading git's documentation on key names after the `-C` finding, then running it |
 | the C API resolved relative paths against the *host process's* directory, not the workspace; every other caller set it by hand | the FFI tests failing once the read-only git rule began refusing paths outside the workspace |
+| `tar -xf x.tar -C /`, `cp tool /usr/local/bin/`, `truncate -s 0 ~/notes` were `confine`: only the shell's own writes (redirects) were judged by destination | measuring what the gate said about program-level `-C` options |
+| resolving symlinks for the system-path check refused `cp tool ~/bin/` for a home under macOS's `/home`, which leads into `/System/Volumes/Data` | the corpus test, whose home is `/home/agent`, disagreeing with the CLI's |
+| `Option::is_none_or` is newer than the project's minimum Rust version | clippy's MSRV lint |
 | git accepts unambiguous abbreviations of long options: `git branch --del x` and `--d x` delete, so a rule listing `--delete` misses them | running git to find out what "read-only" meant, instead of reading its manual |
 | `git log`/`diff`/`show`/`shortlog --output=<file>` writes a file, and was `allow` under a rule called read-only inspection | checking the *other* subcommands of the rule I was fixing |
 | a spec line `--format=%(refname:short)` was an unquoted-parenthesis syntax error, so the gate correctly said `deny` and git errored too | the two halves of the test disagreeing about the same line |
@@ -1221,3 +1224,54 @@ case unchanged at about 2.2 ms (A/B, alternating builds, same 212 commands, only
 the gate's source swapped). The first version cost 1.7 µs a command; the
 difference was deciding, on every evaluation, whether the shell's starting
 directory is inside the workspace — now worked out once per configuration.
+
+## 18. Where a program writes
+
+A redirect is the shell writing on a command's behalf, and the gate has always
+judged those: `> /etc/x` is refused, `>> ~/x` asks. A program writing to a path it
+was *given* is the other half, and was invisible. `tar -xf x.tar -C /` extracts into
+`/`, `cp tool /usr/local/bin/` overwrites a system file, `truncate -s 0 ~/notes`
+empties one — all `confine`, judged no differently from a write inside the workspace.
+
+**Which argument is the destination is the program's business**, so it is written
+down per program in `src/writes.rs`, as `unwrap.rs` writes down each wrapper's
+options: the last operand or `-t` for `cp`, `mv`, `install`, `ln`, `rsync` and
+`ditto`; the directory `tar -x` extracts into (`-C`, or where it runs) and the
+archive `tar -c` creates; `unzip -d`; what `patch` changes; every file `tee` and
+`truncate` name. Each program's options that take a value are listed too, because
+getting that wrong is the dangerous failure: `rsync -a src/ dst/ --exclude .git`
+would otherwise take `.git` for the destination. The policy then asks two things,
+through two new directives: `writes-outside` and `writes-under <dirs>`.
+
+**The verdicts were a decision, and the user made it:** mirror the redirect rules. A
+path the system owns is refused; truncating outside is refused because it destroys
+what was there; any other write outside the workspace asks, because
+`cp tool ~/bin/` is often exactly what the person wants. "Under" includes "above":
+extracting into `/` or `/usr` can land files in `/etc` as surely as extracting into
+`/etc`.
+
+**The system-path check reads the path as the shell names it.** `cd / && tar -x`
+writes `.`, which is `/` — so destinations also carry their absolute spelling from
+every directory the shell may be in (§ 17). An earlier version resolved symlinks for
+this, and on macOS `/home` is a symlink into `/System/Volumes/Data/home`, so
+`cp tool ~/bin/` for a user whose home is there was refused as a write into
+`/System`. That volume is the writable data volume, not the system. The spelling is
+now joined and `..`-collapsed with symlinks left alone — the same textual reading
+the redirect rule it mirrors uses. Whether a destination is *outside the
+workspace* still resolves symlinks.
+
+**Checked against the programs.** `tests/writes.txt` holds about 60 commands in five
+classes. Every line that writes locally is run in a scratch fixture with a
+directory beside the workspace, which is compared before and after: `ask` and
+`truncate` lines must change it, `inside` lines must not (including
+`tar -czf out.tgz -C <outside> f`, which *reads* outside and writes inside). 40 lines
+run for real here; `cp -t` is GNU's and macOS's `cp` rejects it, so that line's
+verdict is checked and its effect reported as unsupported. Eight mutants of the
+table and the rules are each caught.
+
+**Not modelled:** `sed -i` (whose `-i` takes an argument on BSD and does not on GNU,
+so the operands cannot be told apart reliably), `dd of=` (its own rule), `make
+install` and package installs (their own rules); a destination that is not known
+before the command runs (`cp x "$OUT"`) is not escalated; and a symlink inside the
+workspace that points at a system directory makes a write through it `ask`, not
+`deny`, because the system check does not follow links.
