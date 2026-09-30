@@ -192,6 +192,16 @@ fn open_audit(o: &Opts) -> Result<Option<shellguard_runtime::audit::AuditLog>, S
 }
 
 fn build_gate(o: &Opts) -> Result<Gate, String> {
+    build_gate_with_deadline(o, o.deadline_ms)
+}
+
+/// [`build_gate`], with the gate's deadline chosen by the caller.
+///
+/// `-d` means two different things: for `eval` it is the gate's evaluation
+/// budget, for `run` it is how long the *command* may execute. `run` must not
+/// hand its execution timeout to the gate, or `run -d 0` would fail closed on
+/// every command instead of killing the one it started.
+fn build_gate_with_deadline(o: &Opts, deadline_ms: Option<u64>) -> Result<Gate, String> {
     let workspace = match &o.workspace {
         Some(w) => w.clone(),
         None => std::env::current_dir().map_err(|e| format!("cannot read cwd: {e}"))?,
@@ -203,7 +213,7 @@ fn build_gate(o: &Opts) -> Result<Gate, String> {
     // ordinary relative paths look like escapes — a confusing denial, and the
     // kind that teaches people to stop trusting the tool.
     cfg.cwd = o.cwd.clone().unwrap_or(workspace);
-    if let Some(ms) = o.deadline_ms {
+    if let Some(ms) = deadline_ms {
         cfg.deadline = Duration::from_millis(ms);
     }
     match &o.policy {
@@ -363,6 +373,12 @@ fn cmd_run(o: &Opts) -> Result<ExitCode, String> {
     let mut engine = Engine::new(&workspace)
         .map_err(|e| format!("cannot open {}: {e}", workspace.display()))?
         .run_on_ask(o.run_on_ask);
+    // A policy given on the command line must govern `run` exactly as it
+    // governs `eval`. Silently running with the built-in rules instead would let
+    // an operator validate a stricter policy and then execute under a weaker one.
+    if o.policy.is_some() {
+        engine = engine.with_gate(build_gate_with_deadline(o, None)?);
+    }
     if let Some(log) = open_audit(o)? {
         engine = engine.with_audit(log);
     }
