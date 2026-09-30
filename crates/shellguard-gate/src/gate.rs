@@ -144,16 +144,14 @@ impl Gate {
         // the loop below borrows the scratch buffers. Returned at the end, so
         // the allocation is reused across evaluations.
         let mut cmds = std::mem::take(&mut w.cmds);
-        let mut collector = Collector {
-            cfg: &self.config,
-            cache: &mut w.cache,
+        let mut collector = Collector::new(
+            &self.config,
+            &mut w.cache,
             src,
-            span_override: None,
-            limits: self.config.limits,
-            max_unwrap_depth: self.config.max_unwrap_depth,
-            unwrap_truncated: false,
-        };
-        collector.collect(&ast, Ctx::default(), &mut cmds);
+            self.config.limits,
+            self.config.max_unwrap_depth,
+        );
+        collector.collect_root(&ast, Ctx::default(), &mut cmds);
         let unwrap_truncated = collector.unwrap_truncated;
 
         let mut verdict = Verdict::Allow;

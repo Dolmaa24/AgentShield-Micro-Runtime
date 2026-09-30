@@ -278,3 +278,34 @@ allow	find . -exec wc -l {} \;
 # Builtins that change what later commands mean are not on the list.
 confine	export FOO=1 && ls
 confine	umask 022 && ls
+
+# ---------------------------------------------------------------------------
+# The gate follows `cd`. A relative path is judged from every directory the
+# shell may be in by the time the command runs, so `cd / && rm -rf *` is the
+# delete of `/` it is, not the `rm -rf .` it used to be judged as. Each `deny`
+# and `ask` below was `confine`.
+# ---------------------------------------------------------------------------
+deny	cd / && rm -rf *
+deny	cd .. && rm -rf *
+deny	cd /tmp; rm -rf build
+deny	cd ~ && rm -rf project
+deny	pushd /etc && rm -rf *
+deny	if cd /; then rm -rf *; fi
+deny	bash -c 'cd / && rm -rf *'
+deny	env -C / rm -rf home
+deny	sudo -D / rm -rf home
+deny	cd /tmp && echo x > out.txt
+# Where the shell went cannot be known, so neither can what `build` is.
+ask	cd $DIR && rm -rf build
+ask	f() { cd /; }; f; rm -rf build
+ask	for d in a b; do cd $d; done; rm -rf build
+ask	find . -execdir rm -rf {} \;
+# And where it cannot have gone, the answer is unchanged.
+confine	cd src && rm -rf build
+confine	cd /tmp || rm -rf build
+confine	(cd /) && rm -rf build
+confine	cd / & rm -rf build
+confine	cd /tmp && cd - && rm -rf build
+confine	pushd /tmp && popd && rm -rf build
+confine	bash -c 'cd /'; rm -rf build
+allow	cd src && ls

@@ -7,13 +7,16 @@
 //! decision path makes in one file where the caching can be reasoned about.
 
 use shellguard_parse::{
-    basename, parse_with_limits, Limits, Node, Opacity, RedirTarget, Simple, Span, Taint, Word,
-    WordPart,
+    basename, parse_with_limits, Limits, ListOp, Node, Opacity, RedirTarget, Simple, Span, Taint,
+    Word, WordPart,
 };
 
+use std::path::PathBuf;
+
 use crate::config::GateConfig;
+use crate::cwd::{Cwd, DirContext, DirState};
 use crate::resolve::{looks_like_path, PathCache};
-use crate::unwrap::{unwrap_wrapper, Unwrapped};
+use crate::unwrap::{unwrap_wrapper, Chdir, Unwrapped};
 
 /// One argument, resolved.
 #[derive(Clone, Debug, Default)]
@@ -65,6 +68,9 @@ pub struct Cmd {
     /// `timeout 5 rm -rf /`, and a default verdict on the wrapper would make every
     /// wrapped `ls` a `confine`.
     pub wrapper: bool,
+    /// The directories this command may run in, which relative paths in it were
+    /// resolved against. See [`crate::cwd`].
+    pub dirs: Cwd,
 }
 
 impl Cmd {
@@ -102,39 +108,147 @@ pub struct Collector<'a> {
     /// payload failed to parse. Either way something was not judged, and the
     /// caller needs to know rather than see a clean verdict.
     pub unwrap_truncated: bool,
+    /// Where the shell may be standing. On entry to [`collect`](Self::collect),
+    /// where the node starts; on return, where it may be if the node succeeded.
+    pub dirs: DirState,
+    /// On return from [`collect`](Self::collect): where the shell may be if the
+    /// node failed. `&&`, `||` and `if` choose between the two.
+    pub dirs_if_failed: DirState,
+    /// What has been learned so far about things `cd` consults.
+    pub dctx: DirContext,
+    /// Whether every directory in `dirs.pwd` is inside the workspace, for the
+    /// `pwd` it was worked out for. Asked once per command, and almost always
+    /// about the same set.
+    pwd_inside: Option<(Cwd, bool)>,
 }
 
 impl<'a> Collector<'a> {
+    /// A collector for `src`, standing where the configuration says the shell is.
+    pub fn new(
+        cfg: &'a GateConfig,
+        cache: &'a mut PathCache,
+        src: &'a str,
+        limits: Limits,
+        max_unwrap_depth: u8,
+    ) -> Self {
+        let (start, inside) = cache.start(cfg);
+        let dirs = DirState { pwd: Cwd::Known(start), ..DirState::unknown() };
+        let dirs = DirState { stack: Some(Vec::new()), ..dirs };
+        Collector {
+            cfg,
+            cache,
+            src,
+            span_override: None,
+            limits,
+            max_unwrap_depth,
+            unwrap_truncated: false,
+            dirs_if_failed: dirs.clone(),
+            pwd_inside: Some((dirs.pwd.clone(), inside)),
+            dirs,
+            dctx: DirContext::for_source(src),
+        }
+    }
+
+    /// Collect a whole source: the entry point, where [`collect`](Self::collect)
+    /// is for its parts.
+    pub fn collect_root(&mut self, node: &Node, ctx: Ctx, out: &mut Vec<Cmd>) {
+        let changes = self.may_change_dirs(node);
+        self.dctx.set_source_changes_dirs(changes);
+        self.collect(node, ctx, out);
+    }
+
+    /// Record that `node` leaves the directory as it found it, whatever its status.
+    fn unchanged(&mut self, entry: DirState) {
+        self.dirs_if_failed = entry.clone();
+        self.dirs = entry;
+    }
+
+    /// Collect `node` starting from `entry`, and return where it leaves the
+    /// shell: (if it succeeded, if it failed).
+    fn collect_from(
+        &mut self,
+        node: &Node,
+        entry: DirState,
+        ctx: Ctx,
+        out: &mut Vec<Cmd>,
+    ) -> (DirState, DirState) {
+        self.dirs = entry;
+        self.collect(node, ctx, out);
+        (self.dirs.clone(), self.dirs_if_failed.clone())
+    }
+
+    /// Collect the substitutions inside `w`. They run in child shells, before
+    /// the command they belong to, so whatever they `cd` to does not last.
+    fn collect_subs_in_place(&mut self, w: &Word, ctx: Ctx, out: &mut Vec<Cmd>) {
+        let has_subs = w
+            .parts
+            .iter()
+            .any(|p| matches!(p, WordPart::CommandSub { .. } | WordPart::ProcSub { .. }));
+        if !has_subs {
+            return;
+        }
+        let entry = self.dirs.clone();
+        self.collect_word_subs(w, ctx, out);
+        self.dirs = entry;
+    }
+
     pub fn collect(&mut self, node: &Node, ctx: Ctx, out: &mut Vec<Cmd>) {
         match node {
-            Node::Empty | Node::Arith { .. } => {}
+            Node::Empty | Node::Arith { .. } => {
+                let entry = self.dirs.clone();
+                self.unchanged(entry);
+            }
 
             Node::Simple(s) => {
+                // After an alias or a trap, any command may be a `cd` or be
+                // preceded by one.
+                if self.dctx.untrusted() {
+                    self.dirs = DirState::unknown();
+                }
+                let entry = self.dirs.clone();
                 let cmd = self.simple_to_cmd(s, ctx);
                 let at = out.len();
                 out.push(cmd);
                 out[at].wrapper = self.collect_unwrapped(s, ctx, out);
                 // Substitutions inside words are commands in their own right.
                 for w in &s.words {
-                    self.collect_word_subs(w, ctx, out);
+                    self.collect_subs_in_place(w, ctx, out);
                 }
                 for a in &s.assignments {
-                    self.collect_word_subs(&a.value, ctx, out);
+                    self.collect_subs_in_place(&a.value, ctx, out);
                 }
                 for r in &s.redirects {
                     if let RedirTarget::Word(w) = &r.target {
-                        self.collect_word_subs(w, ctx, out);
+                        self.collect_subs_in_place(w, ctx, out);
                     }
                 }
+                let (ok, failed) = self.dir_effect(s, &entry);
+                self.dirs = ok;
+                self.dirs_if_failed = failed;
             }
 
-            Node::Pipeline { commands, .. } => {
+            Node::Pipeline { commands, negated, .. } => {
                 let inner = Ctx { nested: ctx.nested, ..ctx };
+                let entry = self.dirs.clone();
+                let mut last = (entry.clone(), entry.clone());
                 let mut stages: Vec<(usize, usize)> = Vec::with_capacity(commands.len());
                 for c in commands {
                     let start = out.len();
-                    self.collect(c, inner, out);
+                    last = self.collect_from(c, entry.clone(), inner, out);
                     stages.push((start, out.len()));
+                }
+                if commands.len() == 1 {
+                    // `! cmd`: the same shell, the status inverted.
+                    let (ok, failed) = last;
+                    let (ok, failed) = if *negated { (failed, ok) } else { (ok, failed) };
+                    self.dirs = ok;
+                    self.dirs_if_failed = failed;
+                } else {
+                    // Every stage but the last runs in a child shell. The last
+                    // does in bash and dash and does not in zsh, and with
+                    // `pipefail` either outcome can go with either status.
+                    let merged = entry.union(&last.0).union(&last.1);
+                    self.unchanged(merged);
                 }
                 // Link adjacent stages by their head command. `curl x | sh`
                 // must be visible as "curl feeds sh" from both sides, because a
@@ -157,69 +271,180 @@ impl<'a> Collector<'a> {
             }
 
             Node::List { items, .. } => {
+                // `a && b` runs `b` only where `a` succeeded, `a || b` only where
+                // it failed, `a; b` in either; `a & b` runs `a` in a child shell.
+                // `chain_entry` is where the current and-or chain began, and
+                // `chain_passed` every state the chain has been through.
+                let mut chain_entry = self.dirs.clone();
+                let mut state = (chain_entry.clone(), chain_entry.clone());
+                let mut chain_passed = chain_entry.clone();
+                let mut chain_len = 0usize;
+                let mut prev: Option<ListOp> = None;
                 for it in items {
-                    self.collect(&it.node, ctx, out);
+                    let input = match prev {
+                        Some(ListOp::And) => state.0.clone(),
+                        Some(ListOp::Or) => state.1.clone(),
+                        _ => chain_entry.clone(),
+                    };
+                    let (ok, failed) = self.collect_from(&it.node, input, ctx, out);
+                    chain_passed = chain_passed.union(&ok).union(&failed);
+                    chain_len += 1;
+                    state = match prev {
+                        // Skipped when an earlier link failed, so failure also
+                        // leaves the shell where that link did.
+                        Some(ListOp::And) => (ok, state.1.union(&failed)),
+                        Some(ListOp::Or) => (state.0.union(&ok), failed),
+                        _ => (ok, failed),
+                    };
+                    match it.op {
+                        ListOp::Seq => chain_entry = state.0.union(&state.1),
+                        ListOp::Background => {
+                            // A lone `cd / &` moves nothing, in every shell. But
+                            // zsh 5.9 runs the first command of `cd / && x &` in
+                            // this shell and only the rest in the background —
+                            // found by the real-shell test — so a longer chain may
+                            // leave this shell anywhere it went.
+                            // The parser keeps `a && b` as one item holding an
+                            // inner list, so "lone" means one item that is not one.
+                            let lone = chain_len == 1 && !matches!(it.node, Node::List { .. });
+                            let after =
+                                if lone { chain_entry.clone() } else { chain_passed.clone() };
+                            state = (after.clone(), after.clone());
+                            chain_entry = after;
+                        }
+                        ListOp::And | ListOp::Or => {}
+                    }
+                    if matches!(it.op, ListOp::Seq | ListOp::Background) {
+                        chain_passed = chain_entry.clone();
+                        chain_len = 0;
+                    }
+                    prev = Some(it.op);
                 }
+                self.dirs = state.0;
+                self.dirs_if_failed = state.1;
             }
 
-            Node::Subshell { body, redirects, .. } | Node::Group { body, redirects, .. } => {
+            Node::Subshell { body, redirects, .. } => {
                 let inner = Ctx { nested: true, ..ctx };
-                self.collect(body, inner, out);
+                let entry = self.dirs.clone();
                 for r in redirects {
                     if let RedirTarget::Word(w) = &r.target {
-                        self.collect_word_subs(w, inner, out);
+                        self.collect_subs_in_place(w, inner, out);
                     }
                 }
+                self.collect(body, inner, out);
+                // Whatever the child shell did, the parent is where it was.
+                self.unchanged(entry);
+            }
+
+            Node::Group { body, redirects, .. } => {
+                let inner = Ctx { nested: true, ..ctx };
+                for r in redirects {
+                    if let RedirTarget::Word(w) = &r.target {
+                        self.collect_subs_in_place(w, inner, out);
+                    }
+                }
+                // `{ ...; }` runs in this shell, so its `cd` lasts.
+                self.collect(body, inner, out);
             }
 
             Node::If { cond, then, otherwise, .. } => {
                 let inner = Ctx { nested: true, ..ctx };
-                self.collect(cond, inner, out);
-                self.collect(then, inner, out);
-                if let Some(o) = otherwise {
-                    self.collect(o, inner, out);
-                }
+                let entry = self.dirs.clone();
+                let (c_ok, c_failed) = self.collect_from(cond, entry, inner, out);
+                let (t_ok, t_failed) = self.collect_from(then, c_ok, inner, out);
+                let (e_ok, e_failed) = match otherwise {
+                    Some(o) => self.collect_from(o, c_failed, inner, out),
+                    // No `else`: a false condition is a successful `if`.
+                    None => (c_failed.clone(), t_failed.clone()),
+                };
+                self.dirs = t_ok.union(&e_ok);
+                self.dirs_if_failed = t_failed.union(&e_failed);
             }
 
-            Node::For { words, body, .. } => {
+            Node::For { var, words, body, .. } => {
                 let inner = Ctx { nested: true, ..ctx };
                 for w in words {
-                    self.collect_word_subs(w, inner, out);
+                    self.collect_subs_in_place(w, inner, out);
                 }
-                self.collect(body, inner, out);
+                self.dctx.note_loop_variable(var);
+                self.collect_loop(&[body], inner, out);
             }
 
             Node::Loop { cond, body, .. } => {
                 let inner = Ctx { nested: true, ..ctx };
-                self.collect(cond, inner, out);
-                self.collect(body, inner, out);
+                self.collect_loop(&[cond, body], inner, out);
             }
 
             Node::Case { word, arms, .. } => {
                 let inner = Ctx { nested: true, ..ctx };
-                self.collect_word_subs(word, inner, out);
+                self.collect_subs_in_place(word, inner, out);
+                let entry = self.dirs.clone();
+                // An arm can fall through into the next (`;&`), which the tree
+                // does not record, so each arm may start where any earlier one
+                // ended. No arm matching is a success where the shell already was.
+                let mut reach = entry.clone();
+                let mut failed_any: Option<DirState> = None;
                 for arm in arms {
                     for p in &arm.patterns {
-                        self.collect_word_subs(p, inner, out);
+                        self.collect_subs_in_place(p, inner, out);
                     }
-                    self.collect(&arm.body, inner, out);
+                    let (ok, failed) = self.collect_from(&arm.body, reach.clone(), inner, out);
+                    reach = reach.union(&ok).union(&failed);
+                    failed_any = Some(match failed_any {
+                        Some(f) => f.union(&failed),
+                        None => failed,
+                    });
                 }
+                self.dirs = reach;
+                self.dirs_if_failed = failed_any.unwrap_or(entry);
             }
 
-            Node::Function { body, .. } => {
+            Node::Function { name, body, .. } => {
                 // A function body is judged where it is defined. Deferring to
                 // the call site would mean never judging it, since the call may
                 // be in a later command the gate never sees as one unit.
-                self.collect(body, Ctx { nested: true, ..ctx }, out);
+                //
+                // It runs wherever it is later called from, so if anything in this
+                // source can change directory, it is judged as run anywhere.
+                let changes = self.may_change_dirs(body);
+                let entry = self.dirs.clone();
+                let body_entry = if self.dctx.source_changes_dirs() {
+                    DirState::unknown()
+                } else {
+                    entry.clone()
+                };
+                self.collect_from(body, body_entry, Ctx { nested: true, ..ctx }, out);
+                self.dctx.define_function(name, changes);
+                // Defining a function runs nothing.
+                self.unchanged(entry);
             }
 
             Node::Cond { words, .. } => {
                 let inner = Ctx { nested: true, ..ctx };
                 for w in words {
-                    self.collect_word_subs(w, inner, out);
+                    self.collect_subs_in_place(w, inner, out);
                 }
+                let entry = self.dirs.clone();
+                self.unchanged(entry);
             }
         }
+    }
+
+    /// A `for` or `while` loop: `parts` run in order, repeatedly.
+    ///
+    /// If nothing in it can change directory, one pass describes every pass. If
+    /// something can, the second pass starts where the first ended, and so on,
+    /// so the loop is judged — and left — as anywhere. Collecting twice to be
+    /// more precise would double the work for every nested loop.
+    fn collect_loop(&mut self, parts: &[&Node], ctx: Ctx, out: &mut Vec<Cmd>) {
+        let entry = self.dirs.clone();
+        let moves = parts.iter().any(|p| self.may_change_dirs(p));
+        let start = if moves { DirState::unknown() } else { entry.clone() };
+        for p in parts {
+            self.collect_from(p, start.clone(), ctx, out);
+        }
+        self.unchanged(if moves { DirState::unknown() } else { entry });
     }
 
     /// Recover and judge whatever a wrapper is hiding.
@@ -242,8 +467,20 @@ impl<'a> Collector<'a> {
 
         for u in unwrapped {
             let via = u.via();
+            let entry = self.dirs.clone();
             match u {
-                Unwrapped::Argv { words, .. } => {
+                Unwrapped::Argv { words, chdir, .. } => {
+                    // `env -C dir cmd` runs `cmd` in `dir`, and only `cmd`.
+                    match chdir {
+                        Chdir::Stay => {}
+                        Chdir::To(dir) => {
+                            let pwd = self.chdir_target(&entry.pwd, &dir);
+                            self.dirs = DirState { pwd, ..entry.clone() };
+                        }
+                        Chdir::Unknown => {
+                            self.dirs = DirState { pwd: Cwd::Unknown, ..entry.clone() }
+                        }
+                    }
                     let span =
                         words.iter().map(|w| w.span).reduce(|a, b| a.to(b)).unwrap_or(s.span);
                     let synthetic = Simple {
@@ -259,8 +496,11 @@ impl<'a> Collector<'a> {
                     out.push(cmd);
                     out[at].wrapper = self.collect_unwrapped(&synthetic, inner, out);
                     for w in &synthetic.words {
-                        self.collect_word_subs(w, inner, out);
+                        self.collect_subs_in_place(w, inner, out);
                     }
+                    // The wrapped program is a child process: nothing it does to
+                    // its directory reaches this shell.
+                    self.dirs = entry;
                 }
                 Unwrapped::ShellText { text, span, .. } => {
                     let Ok(ast) = parse_with_limits(&text, self.limits) else {
@@ -270,16 +510,22 @@ impl<'a> Collector<'a> {
                         continue;
                     };
                     let mut sub = Collector {
-                        cfg: self.cfg,
-                        cache: &mut *self.cache,
-                        src: &text,
                         span_override: Some(self.span_override.unwrap_or(span)),
-                        limits: self.limits,
-                        max_unwrap_depth: self.max_unwrap_depth,
-                        unwrap_truncated: false,
+                        dirs: entry.clone(),
+                        dirs_if_failed: entry.clone(),
+                        dctx: self.dctx.for_child(&text),
+                        ..Collector::new(
+                            self.cfg,
+                            &mut *self.cache,
+                            &text,
+                            self.limits,
+                            self.max_unwrap_depth,
+                        )
                     };
                     let start = out.len();
-                    sub.collect(&ast, inner, out);
+                    // A child shell: it starts where this one is, and its `cd`
+                    // does not come back.
+                    sub.collect_root(&ast, inner, out);
                     let truncated = sub.unwrap_truncated;
                     self.unwrap_truncated |= truncated;
                     for c in &mut out[start..] {
@@ -315,10 +561,16 @@ impl<'a> Collector<'a> {
 
         cmd.span = self.span_override.unwrap_or(s.span);
         cmd.text = s.span.slice(self.src).to_string();
+        cmd.dirs = self.dirs.pwd.clone();
 
         if let Some(name) = s.program() {
             cmd.program = Some(basename(&name).to_string());
-            if let Some(p) = self.cache.resolve_exec(&name, self.cfg) {
+            // A relative program path is found from where the shell is; with
+            // more than one candidate, the most recent `cd` target is the guess.
+            // Only the name's identity rides on it — rules see the basename
+            // either way.
+            let here = self.dirs.pwd.known().and_then(|d| d.first()).map(PathBuf::as_path);
+            if let Some(p) = self.cache.resolve_exec_in(&name, here, self.cfg) {
                 // Resolution can change the basename: `python` is very often a
                 // symlink to `python3`, and a rule naming one should see the
                 // other. The resolved name wins where they differ.
@@ -333,8 +585,9 @@ impl<'a> Collector<'a> {
             cmd.assignments.push(a.name.clone());
         }
 
+        let bare_names_are_paths = !self.pwd_is_inside();
         for w in s.args() {
-            let arg = self.word_to_arg(w);
+            let arg = self.word_to_arg(w, bare_names_are_paths);
             if let Some(lit) = &arg.literal {
                 if is_short_flag_bundle(lit) {
                     cmd.short_flags.push_str(&lit[1..]);
@@ -352,7 +605,7 @@ impl<'a> Collector<'a> {
             cmd.has_write_redirect = true;
             cmd.has_truncating_redirect |= r.op.truncates();
             if let RedirTarget::Word(w) = &r.target {
-                let t = self.word_to_arg(w);
+                let t = self.word_to_arg(w, bare_names_are_paths);
                 if t.outside_workspace {
                     cmd.write_redirect_outside = true;
                 }
@@ -363,13 +616,60 @@ impl<'a> Collector<'a> {
         cmd
     }
 
-    pub fn word_to_arg(&mut self, w: &Word) -> Arg {
+    /// Whether every directory the shell may be in is inside the workspace.
+    fn pwd_is_inside(&mut self) -> bool {
+        if let Some((pwd, inside)) = &self.pwd_inside {
+            if pwd.same(&self.dirs.pwd) {
+                return *inside;
+            }
+        }
+        let inside = match &self.dirs.pwd {
+            Cwd::Unknown => false,
+            Cwd::Known(dirs) => {
+                dirs.iter().all(|d| !self.cache.classify_in(".", d, self.cfg).outside)
+            }
+        };
+        self.pwd_inside = Some((self.dirs.pwd.clone(), inside));
+        inside
+    }
+
+    /// Where a path argument points, from every directory the shell may be in.
+    fn classify_here(&mut self, raw: &str) -> Placed {
+        let rooted = raw.starts_with('/') || raw.starts_with('~');
+        match &self.dirs.pwd {
+            Cwd::Known(dirs) => {
+                let mut placed = Placed::default();
+                for d in dirs.iter() {
+                    let c = self.cache.classify_in(raw, d, self.cfg);
+                    placed.absolute = c.absolute;
+                    placed.outside |= c.outside;
+                    if rooted {
+                        break;
+                    }
+                }
+                placed
+            }
+            Cwd::Unknown if rooted => {
+                let cwd = self.cfg.cwd.clone();
+                let c = self.cache.classify_in(raw, &cwd, self.cfg);
+                Placed { absolute: c.absolute, outside: c.outside, unresolved: false }
+            }
+            // Relative to somewhere unknown: the same answer `$DIR/x` gets.
+            Cwd::Unknown => Placed { absolute: false, outside: false, unresolved: true },
+        }
+    }
+
+    /// `bare_names_are_paths`: the shell may be outside the workspace, so a name
+    /// with no `/` in it — `build`, `*` — is a path somewhere that matters.
+    /// Inside the workspace it cannot point out of it, and is not worth a lookup.
+    pub fn word_to_arg(&mut self, w: &Word, bare_names_are_paths: bool) -> Arg {
         let literal = w.literal();
         let prefix = w.literal_prefix();
         let taint = w.taint();
 
         let probe = literal.as_deref().unwrap_or(&prefix);
-        let is_path = looks_like_path(probe);
+        let is_path = looks_like_path(probe)
+            || (bare_names_are_paths && !probe.starts_with('-') && taint < Taint::Variable);
 
         let mut arg = Arg {
             prefix,
@@ -381,9 +681,10 @@ impl<'a> Collector<'a> {
 
         match (&literal, is_path) {
             (Some(lit), true) => {
-                let class = self.cache.classify(lit, self.cfg);
-                arg.absolute = class.absolute;
-                arg.outside_workspace = class.outside;
+                let placed = self.classify_here(lit);
+                arg.absolute = placed.absolute;
+                arg.outside_workspace = placed.outside;
+                arg.unresolved_path = placed.unresolved;
             }
             (None, _) if taint >= Taint::Variable => {
                 // A tainted argument that looks like a path, or that could
@@ -396,16 +697,28 @@ impl<'a> Collector<'a> {
             }
             (None, true) => {
                 // Static but glob-expanded, e.g. `build/*`. The prefix is
-                // enough to place it.
-                let class = self.cache.classify(&arg.prefix, self.cfg);
-                arg.absolute = class.absolute;
-                arg.outside_workspace = class.outside;
+                // enough to place it; a bare `*` is the directory itself.
+                let at = if arg.prefix.is_empty() { "." } else { arg.prefix.as_str() };
+                let placed = self.classify_here(at);
+                arg.absolute = placed.absolute;
+                arg.outside_workspace = placed.outside;
+                arg.unresolved_path = placed.unresolved;
             }
             _ => {}
         }
 
         arg
     }
+}
+
+/// Where a path argument lands, from the directories the shell may be in.
+#[derive(Clone, Copy, Debug, Default)]
+struct Placed {
+    absolute: bool,
+    /// Outside the workspace from at least one of them.
+    outside: bool,
+    /// Relative to a directory that is not known.
+    unresolved: bool,
 }
 
 /// `-rf` is a bundle of short flags; `--force` and `-` are not.
@@ -425,17 +738,9 @@ mod tests {
     fn collect_all(src: &str, cfg: &GateConfig) -> Vec<Cmd> {
         let ast = parse(src).unwrap();
         let mut cache = PathCache::default();
-        let mut c = Collector {
-            cfg,
-            cache: &mut cache,
-            src,
-            span_override: None,
-            limits: Limits::default(),
-            max_unwrap_depth: 4,
-            unwrap_truncated: false,
-        };
+        let mut c = Collector::new(cfg, &mut cache, src, Limits::default(), 4);
         let mut out = Vec::new();
-        c.collect(&ast, Ctx::default(), &mut out);
+        c.collect_root(&ast, Ctx::default(), &mut out);
         out
     }
 

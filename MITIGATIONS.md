@@ -352,7 +352,7 @@ embedders can make.
 ### 20. The irreducible risk: the gate can be wrong, a kernel bug is a full escape, rollback doesn't undo side effects
 
 **Status: the verification task is built and macOS is verified; the answer it gave
-is uncomfortable, and the two fixes that remain are decisions rather than code.** Design and
+is uncomfortable, and the fix that remains is a decision rather than code.** Design and
 evidence are in [DESIGN.md § 16](DESIGN.md#16-what-stops-a-command-from-sending-data-out).
 
 Built: `tests/exfiltration.txt` and its harness, with three classes (`blocked`,
@@ -371,7 +371,17 @@ was `allow`; `git remote add` was allowed as inspection; and Landlock denied
 | gap | why it is not just fixed |
 |---|---|
 | Linux: "no network" is TCP only; UDP and Unix sockets are open (read from code, never run) | the fix is a seccomp filter on `socket()`, a user+network namespace, or routing risky commands to gVisor. The first cannot be tested off-Linux; the second fails on hardened kernels |
-| the gate does not follow `cd` | needs a change to path tracking |
+
+**Closed since:** the gate follows `cd`. `cd / && rm -rf *` was `confine`,
+judged as if it ran in the workspace; it is `deny`. The gate tracks the set of
+directories the shell may be in — through `&&`, `||`, `if`, subshells, pipelines,
+`pushd`/`popd`, `cd -`, `CDPATH` and symlinks — and says "unknown" where it
+cannot follow (aliases, traps, `eval`, dynamic program names, loops and functions
+that `cd`). It is checked against real `sh`, `bash`, `zsh` and `dash`: about 400
+points in 90 scripts, where every directory a shell really used must be one the
+gate considered. Found on the way: `rm -rf link/../x` resolved textually (the
+kernel follows `link` first), and `sudo -D / rm …` unwrapped to a program named
+`/`. Both fixed. Details in [DESIGN.md § 17](DESIGN.md#17-following-cd).
 
 **Closed since:** `git branch -D` and `git tag -d` were `allow` ("run directly"). Two
 predicates (`no-positional`, `flags-within`) let the policy allow a `branch` or `tag`

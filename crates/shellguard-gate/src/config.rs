@@ -14,8 +14,11 @@ pub struct GateConfig {
     pub workspace: PathBuf,
     /// The shell's working directory, used to resolve relative paths.
     pub cwd: PathBuf,
-    /// Used to expand a leading `~`.
+    /// Used to expand a leading `~`, and where a bare `cd` goes.
     pub home: Option<PathBuf>,
+    /// `$CDPATH`: where `cd name` looks before `./name`. Empty when unset; an
+    /// empty entry means the current directory.
+    pub cdpath: Vec<PathBuf>,
     /// `$PATH`, in order, used to resolve program names.
     pub path: Vec<PathBuf>,
 
@@ -46,6 +49,7 @@ impl Default for GateConfig {
             workspace: PathBuf::from("."),
             cwd: PathBuf::from("."),
             home: None,
+            cdpath: Vec::new(),
             path: default_path(),
             deadline: crate::gate::DEFAULT_DEADLINE,
             limits: Limits::default(),
@@ -66,6 +70,10 @@ impl GateConfig {
             workspace,
             cwd,
             home: std::env::var_os("HOME").map(PathBuf::from),
+            // Read as the shell reads it, empty entries included.
+            cdpath: std::env::var("CDPATH")
+                .map(|p| p.split(':').map(PathBuf::from).collect())
+                .unwrap_or_default(),
             path: std::env::var_os("PATH")
                 .map(|p| std::env::split_paths(&p).collect())
                 .unwrap_or_else(default_path),

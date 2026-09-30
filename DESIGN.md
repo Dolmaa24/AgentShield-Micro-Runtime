@@ -800,9 +800,13 @@ rule; `git log --output=$HOME/.bashrc` is `confine`.
 `--ext-diff`/`--textconv`, which run programs named in git configuration. The last is
 covered only in that setting such a configuration is `ask` (`vcs.config-executes`).
 
-**The gate does not follow `cd`.** Relative paths resolve against a fixed working
-directory, so `cd / && rm -rf *` is judged like `rm -rf .` — a `confine`, not the
-`deny` a delete of `/` deserves. The kernel stops it; the gate cannot say so.
+**The gate follows `cd` now (§ 17), with stated edges.** It used to resolve every
+relative path against one fixed directory, so `cd / && rm -rf *` was judged like
+`rm -rf .` — `confine` for a delete of `/`. What it still does not follow:
+program-specific directory options (`tar -C /`, `make -C`, `git -C`), which name
+where one program works rather than where the shell is; functions and aliases
+inherited from the environment rather than defined in the command; and `~` in an
+*argument* after `HOME` is reassigned (a bare `cd` or `cd ~` is handled).
 
 **cgroups are not wired up.** `Profile` carries `max_processes` and
 `max_memory_bytes` and on Linux nothing enforces them yet. Fork bombs are caught
@@ -866,6 +870,13 @@ tests that found them.
 | a "did not run" assertion searched stdout for text the refusal message itself prints | the test failing on the wrong thing |
 | a multi-workspace test assumed two engine handles when handles are created lazily | the test failing |
 | a test built a C string containing NUL, which a C string cannot | the test failing to construct its input |
+| `cd / && rm -rf *` was `confine`: every relative path was resolved against one fixed directory | asking where `rm -rf *` would land after a `cd` |
+| `rm -rf link/../x` was resolved textually to `./x`; the kernel resolves `link` first, so it is a sibling of the link's *target* | building the symlink fixture for `cd`, and reading the file back through the path |
+| `sudo -D / rm -rf x` unwrapped to a program named `/`, so the `rm` was never judged | adding `-D` as a directory option and finding it was not known to take a value |
+| zsh 5.9 runs the first command of `cd / && x &` in the current shell, not the background job | the real-shell test, on its first run |
+| three test fixtures shared one directory and deleted it under each other | `getcwd: cannot access parent directories` from a shell mid-test |
+| two mutants of the `cd` model survived: every script followed an `if` with `;`, which merges both outcomes, and nothing reset the state after an alias | mutation testing |
+| following `cd` first cost 1.7 µs a command, mostly re-deciding per evaluation where the shell *starts* | an A/B benchmark with only the gate's source swapped |
 | git accepts unambiguous abbreviations of long options: `git branch --del x` and `--d x` delete, so a rule listing `--delete` misses them | running git to find out what "read-only" meant, instead of reading its manual |
 | `git log`/`diff`/`show`/`shortlog --output=<file>` writes a file, and was `allow` under a rule called read-only inspection | checking the *other* subcommands of the rule I was fixing |
 | a spec line `--format=%(refname:short)` was an unquoted-parenthesis syntax error, so the gate correctly said `deny` and git errored too | the two halves of the test disagreeing about the same line |
@@ -1121,3 +1132,68 @@ handled both TCP rights unless the profile could listen, so a profile granted
 decision and now lives in `landlock_abi.rs`, which compiles everywhere and is
 tested here; the Linux code that calls it type-checks for both architectures and
 has never run.
+
+## 17. Following `cd`
+
+Every rule about where a path points is only as good as the directory a
+relative path is resolved against. The gate used to use one fixed directory, so
+`cd / && rm -rf *` was judged exactly like `rm -rf .`.
+
+**What the gate knows is a set.** It does not run the shell, so it cannot know
+which directory the shell is in; it knows every directory the shell *could* be
+in at each command, or that it cannot bound it. A path is outside the workspace
+if it is outside from any directory in the set, and unresolved if the set is
+unknown — the same answer `rm -rf $DIR` already got. Once the shell may be
+outside the workspace, a bare name (`build`, `*`) counts as a path, because it
+now names something outside.
+
+**Two sets, because `&&` and `||` choose.** The collector carries where the
+shell may be if the last thing succeeded and if it failed. After `cd /tmp && x`,
+`x` runs only in `/tmp`; after `cd /tmp || x`, only where the shell already was;
+after `cd /tmp; x`, in either; `(cd /)`, `$(cd /)` and `cd / &` move nothing.
+`if`, `case`, pipelines, `pushd`/`popd` and `cd -` are tracked the same way.
+
+| before | after | why |
+|---|---|---|
+| `cd / && rm -rf *` `confine` | `deny` | `*` is `/`'s entries |
+| `cd .. && rm -rf *` `confine` | `deny` | outside the workspace |
+| `cd /tmp && echo x > out.txt` `confine` | `deny` | truncates `/tmp/out.txt` |
+| `env -C / rm -rf home`, `sudo -D / …` `confine` | `deny` | the wrapper `chdir`s first |
+| `cd $DIR && rm -rf build` `confine` | `ask` | `build` could be anywhere |
+| `cd src && rm -rf build` `confine` | `confine` | unchanged: still inside |
+| `cd /tmp || rm -rf build` `confine` | `confine` | `rm` runs only if `cd` failed |
+
+**Measured before it was modelled.** Probing `sh`, `bash`, `zsh` and `dash` on
+this machine settled what reading the manuals would have guessed at:
+
+- `cd` is *logical* — `cd link && cd ..` goes back — but the kernel resolves a
+  relative path *physically*: after `cd link`, `rm ../x` deletes a sibling of the
+  link's target. So the set holds directories as `cd` spells them, arguments are
+  resolved from where the directory really is, and where the two readings of a
+  `cd` are different directories (`set -P` changes which one `cd` means) both go
+  in the set.
+- With `CDPATH` exported, `cd src` goes to `$CDPATH/src` even when `./src`
+  exists. It is read from the gate's environment.
+- `zsh` keeps a `cd` made in the last stage of a pipeline; the others do not.
+  And `zsh` 5.9 runs the *first* command of `cd / && x &` in the current shell.
+- An alias defined on one line is a `cd` on the next, even in `sh -c`; `trap
+  'cd /' DEBUG` runs before every later command; `c=cd; $c /` is a `cd`; a
+  function that calls `cd` moves its caller; `declare "HO"ME=/` changes where a
+  bare `cd` goes. None of these can be followed without running the shell, so
+  each makes the directory unknown from that point on — it does not guess.
+
+**How it is checked.** Not against the model's author: against the shells.
+`every_directory_a_real_shell_was_in_is_one_the_gate_considered` runs about 90
+scripts — every construct above and its edges — under all four shells, with
+marks that record `pwd -P`, and requires every directory a shell really was in
+to be in the gate's set (about 400 marks, over 70% of them with a known set, so
+"unknown" is not doing the work). A second test pins the *exact* set for what
+agents write, so the model cannot get sound by getting lazy. The first run found
+the `zsh` background case. 23 mutants of the model's rules are each caught; two
+survived the first round and each exposed a gap in the tests, not the code.
+
+**Cost.** Median evaluation 3.0 → 3.3 µs, mean 3.8 → 4.3 µs, worst adversarial
+case unchanged at about 2.2 ms (A/B, alternating builds, same 212 commands, only
+the gate's source swapped). The first version cost 1.7 µs a command; the
+difference was deciding, on every evaluation, whether the shell's starting
+directory is inside the workspace — now worked out once per configuration.

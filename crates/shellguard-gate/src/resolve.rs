@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use crate::config::GateConfig;
 
@@ -43,6 +44,22 @@ pub struct PathCache {
     cap: usize,
     hits: u64,
     misses: u64,
+    /// Where every evaluation starts: the configured working directory, as the
+    /// one-element set the collector begins from, and whether it is inside the
+    /// workspace. The same for every evaluation until the configuration changes,
+    /// and asked by every one of them.
+    start: Option<Start>,
+    /// The last directory a relative path was resolved from, and where it
+    /// really is. Almost always the configured working directory.
+    base: Option<(PathBuf, PathBuf)>,
+}
+
+#[derive(Debug)]
+struct Start {
+    cwd: PathBuf,
+    workspace: PathBuf,
+    dirs: Arc<[PathBuf]>,
+    inside: bool,
 }
 
 impl Default for PathCache {
@@ -53,7 +70,15 @@ impl Default for PathCache {
 
 impl PathCache {
     pub fn with_capacity(cap: usize) -> Self {
-        PathCache { exec: HashMap::new(), canon: HashMap::new(), cap, hits: 0, misses: 0 }
+        PathCache {
+            exec: HashMap::new(),
+            canon: HashMap::new(),
+            cap,
+            hits: 0,
+            misses: 0,
+            start: None,
+            base: None,
+        }
     }
 
     pub fn hit_rate(&self) -> f64 {
@@ -68,6 +93,39 @@ impl PathCache {
     pub fn clear(&mut self) {
         self.exec.clear();
         self.canon.clear();
+        self.start = None;
+        self.base = None;
+    }
+
+    /// The directory set an evaluation starts from, and whether it lies inside
+    /// the workspace. Worked out once per configuration, not once per command.
+    pub(crate) fn start(&mut self, cfg: &GateConfig) -> (Arc<[PathBuf]>, bool) {
+        if let Some(s) = &self.start {
+            if s.cwd == cfg.cwd && s.workspace == cfg.workspace {
+                return (s.dirs.clone(), s.inside);
+            }
+        }
+        let inside = !self.classify_in(".", &cfg.cwd, cfg).outside;
+        let dirs: Arc<[PathBuf]> = Arc::from(vec![cfg.cwd.clone()]);
+        self.start = Some(Start {
+            cwd: cfg.cwd.clone(),
+            workspace: cfg.workspace.clone(),
+            dirs: dirs.clone(),
+            inside,
+        });
+        (dirs, inside)
+    }
+
+    /// Where `cwd` really is, remembered for the next path from the same place.
+    fn physical_base(&mut self, cwd: &Path) -> PathBuf {
+        if let Some((logical, physical)) = &self.base {
+            if logical == cwd {
+                return physical.clone();
+            }
+        }
+        let physical = self.resolve_existing_ancestor(cwd);
+        self.base = Some((cwd.to_path_buf(), physical.clone()));
+        physical
     }
 
     /// Resolve a program name to an absolute path.
@@ -75,44 +133,120 @@ impl PathCache {
     /// A name containing `/` is a path and is resolved against the working
     /// directory. Anything else is searched for on `$PATH`.
     pub fn resolve_exec(&mut self, name: &str, cfg: &GateConfig) -> Option<PathBuf> {
+        let cwd = cfg.cwd.clone();
+        self.resolve_exec_in(name, Some(&cwd), cfg)
+    }
+
+    /// [`resolve_exec`](Self::resolve_exec) with the shell standing in `cwd`, or
+    /// somewhere unknown (`None`), which leaves a relative path unresolvable.
+    pub fn resolve_exec_in(
+        &mut self,
+        name: &str,
+        cwd: Option<&Path>,
+        cfg: &GateConfig,
+    ) -> Option<PathBuf> {
         if name.is_empty() {
             return None;
         }
-        if let Some(cached) = self.exec.get(name) {
+        // A name with a `/` is a path, cached by where it points: after a `cd`,
+        // the same `./build.sh` is a different program.
+        let path = if name.contains('/') {
+            let p = expand_tilde(name, cfg);
+            Some(if p.is_absolute() {
+                p
+            } else {
+                let base = self.resolve_existing_ancestor(cwd?);
+                base.join(p)
+            })
+        } else {
+            None
+        };
+        let key = match &path {
+            Some(p) => p.to_string_lossy().into_owned(),
+            None => name.to_string(),
+        };
+        if let Some(cached) = self.exec.get(&key) {
             self.hits += 1;
             return cached.clone();
         }
         self.misses += 1;
 
-        let found = if name.contains('/') {
-            let p = expand_tilde(name, cfg);
-            let p = if p.is_absolute() { p } else { cfg.cwd.join(p) };
-            is_executable_file(&p).then(|| lexical_normalize(&p))
-        } else {
-            cfg.path.iter().find_map(|dir| {
+        let found = match &path {
+            Some(p) => is_executable_file(p).then(|| lexical_normalize(p)),
+            None => cfg.path.iter().find_map(|dir| {
                 let cand = dir.join(name);
                 is_executable_file(&cand).then(|| lexical_normalize(&cand))
-            })
+            }),
         };
 
         if self.exec.len() >= self.cap {
             self.exec.clear();
         }
-        self.exec.insert(name.to_string(), found.clone());
+        self.exec.insert(key, found.clone());
         found
     }
 
     /// Classify a path argument relative to the workspace.
     pub fn classify(&mut self, raw: &str, cfg: &GateConfig) -> PathClass {
+        let cwd = cfg.cwd.clone();
+        self.classify_in(raw, &cwd, cfg)
+    }
+
+    /// [`classify`](Self::classify) with the shell standing in `cwd`.
+    ///
+    /// A relative path is joined to where `cwd` *really* is, not to how it is
+    /// spelled: after `cd link` (a symlink to `/elsewhere`), the kernel resolves
+    /// `../x` to `/x`, while the text `link/../x` reads as `./x`.
+    pub fn classify_in(&mut self, raw: &str, cwd: &Path, cfg: &GateConfig) -> PathClass {
         if raw.is_empty() {
             return PathClass::default();
         }
         let expanded = expand_tilde(raw, cfg);
         let absolute = expanded.is_absolute();
-        let joined = if absolute { expanded } else { cfg.cwd.join(expanded) };
-        let resolved = self.resolve_existing_ancestor(&joined);
+        let resolved = if dotdot_after_name(&expanded) {
+            // `link/../x`: textually `./x`, but the kernel resolves `link` first,
+            // so `..` is the parent of wherever `link` points. Walked a component
+            // at a time; only paths shaped like this pay for it.
+            self.physical(Some(cwd), &expanded)
+        } else {
+            let joined = if absolute {
+                expanded
+            } else {
+                let base = self.physical_base(cwd);
+                base.join(expanded)
+            };
+            self.resolve_existing_ancestor(&joined)
+        };
         let workspace = self.resolve_existing_ancestor(&cfg.workspace);
         PathClass { absolute, outside: !resolved.starts_with(&workspace) }
+    }
+
+    /// Where `chdir(path)` from `base` really lands: each component resolved
+    /// through its symlinks before the next `..` is applied, as the kernel does.
+    /// Past the first component that does not exist, the rest is applied
+    /// textually. Each step goes through the same cache as every other lookup,
+    /// so a `cd` the gate has seen before costs no system call.
+    pub(crate) fn physical(&mut self, base: Option<&Path>, path: &Path) -> PathBuf {
+        let mut cur = match base {
+            Some(b) if !path.is_absolute() => self.physical_base(b),
+            _ => PathBuf::from("/"),
+        };
+        for c in path.components() {
+            match c {
+                Component::RootDir => cur = PathBuf::from("/"),
+                Component::Prefix(_) | Component::CurDir => {}
+                // `cur` is always a real location, so its parent is the real
+                // parent.
+                Component::ParentDir => {
+                    cur.pop();
+                }
+                Component::Normal(n) => {
+                    cur.push(n);
+                    cur = self.resolve_existing_ancestor(&cur);
+                }
+            }
+        }
+        cur
     }
 
     /// Canonicalise the longest existing prefix of a path, then reattach the
@@ -123,7 +257,7 @@ impl PathCache {
     /// a symlinked parent. Doing both catches the case that matters — a
     /// workspace subdirectory symlinked out to `/etc` — at the cost of one
     /// cached syscall per directory.
-    fn resolve_existing_ancestor(&mut self, path: &Path) -> PathBuf {
+    pub(crate) fn resolve_existing_ancestor(&mut self, path: &Path) -> PathBuf {
         let normalized = lexical_normalize(path);
         let mut prefix = normalized.as_path();
         let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
@@ -176,6 +310,21 @@ fn expand_tilde(raw: &str, cfg: &GateConfig) -> PathBuf {
         }
     }
     PathBuf::from(raw)
+}
+
+/// A `..` that follows a name, where reading it textually and reading it the
+/// way the kernel does can disagree. A leading `..` cannot: it is applied to a
+/// directory that has already been resolved.
+fn dotdot_after_name(p: &Path) -> bool {
+    let mut named = false;
+    for c in p.components() {
+        match c {
+            Component::Normal(_) => named = true,
+            Component::ParentDir if named => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Resolve `.` and `..` textually, without touching the filesystem.

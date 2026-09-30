@@ -19,11 +19,23 @@
 
 use shellguard_parse::{Simple, Span, Word};
 
+/// Where a wrapper runs the command it wraps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Chdir {
+    /// Where the wrapper itself is.
+    Stay,
+    /// `env -C dir`, `sudo -D dir`: the wrapper calls `chdir(dir)` first.
+    To(String),
+    /// Somewhere that cannot be known: `find -execdir` runs in the directory of
+    /// each match, and `env -C $DIR` in wherever `$DIR` points.
+    Unknown,
+}
+
 /// A command recovered from inside a wrapper.
 #[derive(Clone, Debug)]
 pub enum Unwrapped<'a> {
     /// The inner command is a run of words from the outer one.
-    Argv { words: &'a [Word], via: &'static str },
+    Argv { words: &'a [Word], via: &'static str, chdir: Chdir },
     /// The inner command is shell source that has to be parsed.
     ShellText { text: String, span: Span, via: &'static str },
 }
@@ -45,9 +57,13 @@ struct Shape {
     positionals: usize,
     /// `NAME=value` arguments belong to the wrapper, as with `env`.
     assignments: bool,
+    /// Options whose value is a directory the wrapper changes into before
+    /// running the command. Each must also be in `value_flags`.
+    chdir_flags: &'static [&'static str],
 }
 
-const PLAIN: Shape = Shape { value_flags: &[], positionals: 0, assignments: false };
+const PLAIN: Shape =
+    Shape { value_flags: &[], positionals: 0, assignments: false, chdir_flags: &[] };
 
 fn shape_for(program: &str) -> Option<(Shape, &'static str)> {
     Some(match program {
@@ -68,20 +84,24 @@ fn shape_for(program: &str) -> Option<(Shape, &'static str)> {
                     "--role",
                     "--type",
                     "--host",
+                    // Without these, `sudo -D / rm -rf x` unwrapped to a program
+                    // named `/`, and the `rm` was never judged.
+                    "-D",
+                    "--chdir",
                 ],
                 positionals: 0,
                 assignments: true,
+                chdir_flags: &["-D", "--chdir"],
             },
             "sudo",
         ),
-        "doas" => {
-            (Shape { value_flags: &["-u", "-C"], positionals: 0, assignments: false }, "doas")
-        }
+        "doas" => (Shape { value_flags: &["-u", "-C"], chdir_flags: &[], ..PLAIN }, "doas"),
         "env" => (
             Shape {
                 value_flags: &["-u", "-C", "-S", "--unset", "--chdir", "--split-string"],
                 positionals: 0,
                 assignments: true,
+                chdir_flags: &["-C", "--chdir"],
             },
             "env",
         ),
@@ -89,42 +109,23 @@ fn shape_for(program: &str) -> Option<(Shape, &'static str)> {
         "setsid" => (PLAIN, "setsid"),
         "eatmydata" => (PLAIN, "eatmydata"),
         "proxychains" | "proxychains4" => (PLAIN, "proxychains"),
-        "stdbuf" => (
-            Shape { value_flags: &["-i", "-o", "-e"], positionals: 0, assignments: false },
-            "stdbuf",
-        ),
-        "nice" => (
-            Shape { value_flags: &["-n", "--adjustment"], positionals: 0, assignments: false },
-            "nice",
-        ),
-        "ionice" => (
-            Shape { value_flags: &["-c", "-n", "-p", "-t"], positionals: 0, assignments: false },
-            "ionice",
-        ),
+        "stdbuf" => (Shape { value_flags: &["-i", "-o", "-e"], ..PLAIN }, "stdbuf"),
+        "nice" => (Shape { value_flags: &["-n", "--adjustment"], ..PLAIN }, "nice"),
+        "ionice" => (Shape { value_flags: &["-c", "-n", "-p", "-t"], ..PLAIN }, "ionice"),
         // `timeout DURATION COMMAND` — the duration is the wrapper's own.
         "timeout" | "gtimeout" => (
             Shape {
                 value_flags: &["-s", "-k", "--signal", "--kill-after"],
                 positionals: 1,
-                assignments: false,
+                ..PLAIN
             },
             "timeout",
         ),
-        "taskset" => {
-            (Shape { value_flags: &["-p", "-c"], positionals: 1, assignments: false }, "taskset")
+        "taskset" => (Shape { value_flags: &["-p", "-c"], positionals: 1, ..PLAIN }, "taskset"),
+        "watch" => (Shape { value_flags: &["-n", "-d", "--interval"], ..PLAIN }, "watch"),
+        "strace" | "ltrace" | "dtruss" | "ktrace" => {
+            (Shape { value_flags: &["-o", "-e", "-p", "-s", "-f"], ..PLAIN }, "trace")
         }
-        "watch" => (
-            Shape { value_flags: &["-n", "-d", "--interval"], positionals: 0, assignments: false },
-            "watch",
-        ),
-        "strace" | "ltrace" | "dtruss" | "ktrace" => (
-            Shape {
-                value_flags: &["-o", "-e", "-p", "-s", "-f"],
-                positionals: 0,
-                assignments: false,
-            },
-            "trace",
-        ),
         "xargs" | "gxargs" => (
             Shape {
                 value_flags: &[
@@ -145,8 +146,7 @@ fn shape_for(program: &str) -> Option<(Shape, &'static str)> {
                     "--arg-file",
                     "--max-lines",
                 ],
-                positionals: 0,
-                assignments: false,
+                ..PLAIN
             },
             "xargs",
         ),
@@ -186,6 +186,7 @@ fn generic<'a>(s: &'a Simple, shape: &Shape, via: &'static str) -> Vec<Unwrapped
     let args = s.args();
     let mut i = 0;
     let mut positionals_left = shape.positionals;
+    let mut chdir = Chdir::Stay;
 
     while i < args.len() {
         let Some(lit) = args[i].literal() else {
@@ -208,6 +209,16 @@ fn generic<'a>(s: &'a Simple, shape: &Shape, via: &'static str) -> Vec<Unwrapped
         if lit.starts_with('-') && lit.len() > 1 {
             // `-n 10` consumes a following word; `-n10` and `-n=10` do not.
             let takes_value = shape.value_flags.iter().any(|f| lit == *f) && !lit.contains('=');
+            if shape.chdir_flags.contains(&lit.as_str()) {
+                chdir = match args.get(i + 1).and_then(Word::literal) {
+                    Some(dir) => Chdir::To(dir),
+                    None => Chdir::Unknown,
+                };
+            } else if let Some((flag, dir)) = lit.split_once('=') {
+                if flag.starts_with("--") && shape.chdir_flags.contains(&flag) {
+                    chdir = Chdir::To(dir.to_string());
+                }
+            }
             i += 1;
             if takes_value {
                 i += 1;
@@ -226,7 +237,7 @@ fn generic<'a>(s: &'a Simple, shape: &Shape, via: &'static str) -> Vec<Unwrapped
     if i >= args.len() {
         return Vec::new();
     }
-    vec![Unwrapped::Argv { words: &args[i..], via }]
+    vec![Unwrapped::Argv { words: &args[i..], via, chdir }]
 }
 
 /// `sh -c '<source>'`.
@@ -292,7 +303,8 @@ fn find_exec(s: &Simple) -> Vec<Unwrapped<'_>> {
             }
         }
         if start < end {
-            out.push(Unwrapped::Argv { words: &args[start..end], via });
+            let chdir = if via.ends_with("dir") { Chdir::Unknown } else { Chdir::Stay };
+            out.push(Unwrapped::Argv { words: &args[start..end], via, chdir });
         }
         i = end.max(start) + 1;
     }
@@ -446,5 +458,37 @@ mod tests {
         assert!(!is_assignment("2FOO=bar"));
         assert!(!is_assignment("--flag"));
         assert!(!is_assignment("plain"));
+    }
+
+    fn chdir_of(src: &str) -> Chdir {
+        let s = simple(src);
+        match unwrap_wrapper(&s).into_iter().next() {
+            Some(Unwrapped::Argv { chdir, .. }) => chdir,
+            other => panic!("{src}: expected an argv unwrap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrappers_that_change_directory_say_where() {
+        assert_eq!(chdir_of("env -C /tmp rm x"), Chdir::To("/tmp".into()));
+        assert_eq!(chdir_of("env --chdir /tmp rm x"), Chdir::To("/tmp".into()));
+        assert_eq!(chdir_of("env --chdir=/tmp rm x"), Chdir::To("/tmp".into()));
+        assert_eq!(chdir_of("env -C $D rm x"), Chdir::Unknown);
+        assert_eq!(chdir_of("env A=1 rm x"), Chdir::Stay);
+        assert_eq!(chdir_of("sudo -D / rm x"), Chdir::To("/".into()));
+        assert_eq!(chdir_of("sudo --chdir=/ rm x"), Chdir::To("/".into()));
+        // sudo's `-C` closes file descriptors; it is not a directory.
+        assert_eq!(chdir_of("sudo -C 5 rm x"), Chdir::Stay);
+        assert_eq!(chdir_of("find . -execdir rm {} ;"), Chdir::Unknown);
+        assert_eq!(chdir_of("find . -exec rm {} ;"), Chdir::Stay);
+        assert_eq!(chdir_of("timeout 5 rm x"), Chdir::Stay);
+    }
+
+    #[test]
+    fn sudo_chdir_consumes_its_value() {
+        // Before -D was known to take a value, `/` was taken for the program and
+        // the `rm` behind it was never judged.
+        assert_eq!(inner("sudo -D / rm -rf x"), vec!["rm"]);
+        assert_eq!(inner("sudo --chdir / rm -rf x"), vec!["rm"]);
     }
 }
