@@ -495,10 +495,36 @@ rule safe.inspection allow
   cap fs.read
 end
 
+# Shell builtins that only move around or test a condition. They run nothing,
+# but each is still a command as far as the gate is concerned, and a command no
+# rule speaks for takes the policy default — so without this, `cd src && ls`
+# would be a `confine`. The default applies per command, not once per line.
+#
+# Deliberately absent, because each changes what later commands mean or runs
+# something: export, set, unset, source, `.`, eval, exec, trap, alias, umask.
+rule safe.shell-builtins allow
+  reason shell builtins that only change directory or test a condition
+  program cd pushd popd test [ :
+  not path-outside-workspace
+  not write-redirect
+  not unresolved-path
+  cap fs.read
+end
+
+# `remote` is listed for `git remote -v`, but the subcommand also configures
+# where a later push goes (`add`, `set-url`), deletes configuration (`remove`,
+# `rename`) and reaches out over the network (`update`, `prune`). Those words as
+# arguments take the rule out of play, so they fall to the policy default.
+#
+# `branch` and `tag` have the same shape and are NOT fixed here: `git branch
+# newname` and `git branch -D old` mutate, and telling them from `git branch
+# --list` needs a predicate for "no positional arguments" that the policy
+# language does not have yet.
 rule safe.vcs-inspection allow
   reason read-only version control inspection
   program git
   subcommand status log diff show branch remote describe rev-parse blame shortlog tag
+  not arg-eq add set-url remove rm rename prune update set-head set-branches
   not write-redirect
   cap fs.read
 end

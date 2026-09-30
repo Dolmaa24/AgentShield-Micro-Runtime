@@ -264,6 +264,130 @@ mod tests {
         assert!(d.findings.is_empty());
     }
 
+    // ------------------------------------------- the default is per command
+
+    #[test]
+    fn an_unknown_program_is_not_laundered_into_allow_by_an_allowed_neighbour() {
+        // The default used to apply only when NOTHING on the line matched a rule,
+        // so any allowed command beside an unknown one hid it. `allow` means "run
+        // directly", so this was an unsandboxed run of whatever followed the `;`.
+        for cmd in [
+            "some-unknown-tool; ls",
+            "ls; some-unknown-tool",
+            "ls && some-unknown-tool",
+            "false || some-unknown-tool; ls",
+            "some-unknown-tool | cat",
+            "cat secrets.txt | some-unknown-tool",
+            "some-unknown-tool $(cat secrets.txt)",
+            "echo $(some-unknown-tool)",
+            "ls\nsome-unknown-tool",
+        ] {
+            assert_eq!(verdict(cmd), Verdict::Confine, "`{cmd}` was laundered");
+        }
+    }
+
+    #[test]
+    fn the_unknown_program_beside_an_allowed_one_is_named_in_the_findings() {
+        // The verdict must explain itself: the first line of a report is the reason.
+        let d = gate().evaluate_once("ls && some-unknown-tool --flag");
+        assert_eq!(d.verdict, Verdict::Confine);
+        let f = d.findings.first().expect("the default verdict needs a finding to explain it");
+        assert_eq!(f.rule_id, "policy.default");
+        assert_eq!(f.verdict, Verdict::Confine);
+        assert_eq!(f.program.as_deref(), Some("some-unknown-tool"));
+        assert!(f.excerpt.contains("some-unknown-tool"), "{:?}", f.excerpt);
+        assert!(f.caps.is_empty());
+    }
+
+    #[test]
+    fn two_unknown_programs_each_get_their_own_finding() {
+        let d = gate().evaluate_once("ls; tool-one; tool-two");
+        let named: Vec<_> = d
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "policy.default")
+            .filter_map(|f| f.program.as_deref())
+            .collect();
+        assert_eq!(named, ["tool-one", "tool-two"]);
+    }
+
+    #[test]
+    fn an_unknown_program_on_its_own_still_has_no_findings() {
+        // Unchanged: with nothing matched at all, "no findings" already reads as
+        // "the default applied", and a synthetic finding would only add noise.
+        let d = gate().evaluate_once("some-unknown-tool --flag");
+        assert_eq!(d.verdict, Verdict::Confine);
+        assert!(d.findings.is_empty());
+    }
+
+    #[test]
+    fn a_wrapper_is_judged_through_what_it_wraps_and_not_asked_for_a_rule_of_its_own() {
+        // `timeout` matching no rule says nothing about what it runs. Applying the
+        // default to the wrapper would turn every wrapped `ls` into a confine.
+        for cmd in [
+            "timeout 5 ls",
+            "env FOO=1 ls",
+            "nice ls",
+            "bash -c 'ls'",
+            "sh -c 'ls; pwd'",
+            "find . -exec wc -l {} \\;",
+            "xargs echo < list.txt",
+        ] {
+            assert_eq!(verdict(cmd), Verdict::Allow, "`{cmd}`");
+        }
+        // And the wrapped command still counts: an unknown one is not exempt.
+        assert_eq!(verdict("timeout 5 some-unknown-tool"), Verdict::Confine);
+        assert_eq!(verdict("bash -c 'ls; some-unknown-tool'"), Verdict::Confine);
+        assert_eq!(verdict("env FOO=1 some-unknown-tool"), Verdict::Confine);
+    }
+
+    #[test]
+    fn a_wrapper_around_something_dangerous_is_still_denied() {
+        assert_eq!(verdict("sudo timeout 5 rm -rf /etc"), Verdict::Deny);
+        assert_eq!(verdict("bash -c 'rm -rf /etc'"), Verdict::Deny);
+    }
+
+    #[test]
+    fn builtins_that_only_move_around_or_test_do_not_cost_the_line_its_allow() {
+        for cmd in [
+            "cd src && ls",
+            "test -f Cargo.toml && echo yes",
+            "[ -d src ] && ls src",
+            "(cd src && ls)",
+        ] {
+            assert_eq!(verdict(cmd), Verdict::Allow, "`{cmd}`");
+        }
+    }
+
+    #[test]
+    fn builtins_that_change_what_later_commands_mean_are_not_on_that_list() {
+        for cmd in ["export FOO=1 && ls", "umask 022 && ls", "alias ls=rm && ls", "set -x && ls"] {
+            assert_eq!(verdict(cmd), Verdict::Confine, "`{cmd}`");
+        }
+    }
+
+    #[test]
+    fn a_command_whose_program_is_computed_is_never_mistaken_for_one_that_runs_nothing() {
+        // `$CMD args` has no nameable program but does execute something. It must
+        // not be waved through as the harmless assignment-only case.
+        let d = gate().evaluate_once("ls; $CMD --flag");
+        assert!(d.verdict >= Verdict::Confine, "{:?}", d.verdict);
+    }
+
+    #[test]
+    fn a_line_that_only_assigns_a_variable_takes_the_default_as_before() {
+        // Nothing here executes, and no rule fired: silence is not evidence of
+        // safety, so the default still applies to the line as a whole.
+        assert_eq!(verdict("FOO=bar"), Verdict::Confine);
+        assert_eq!(verdict(""), Verdict::Confine);
+    }
+
+    #[test]
+    fn the_default_never_lowers_a_stricter_verdict() {
+        assert_eq!(verdict("some-unknown-tool; rm -rf /etc"), Verdict::Deny);
+        assert_eq!(verdict("ls; git push --force origin main"), Verdict::Ask);
+    }
+
     #[test]
     fn an_empty_command_is_harmless() {
         let d = gate().evaluate_once("");

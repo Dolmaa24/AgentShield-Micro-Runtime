@@ -1370,12 +1370,19 @@ mod reload_tests {
                     let mut seen = (0, 0);
                     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                         let d = eval(e, "echo hi");
+                        // A decision that ran out of its 10 ms budget fails closed
+                        // whatever the rules say. That is a latency event under
+                        // this test's deliberate CPU contention, not a policy
+                        // mix-up, and counting it as one made this test flaky.
+                        if d.get("complete").and_then(json::Json::as_bool) == Some(false) {
+                            continue;
+                        }
                         let (p, v) = (s(&d, "policy").to_string(), s(&d, "verdict").to_string());
                         if p == fp_a {
-                            assert_eq!(v, "deny", "policy A named with B's verdict");
+                            assert_eq!(v, "deny", "policy A named with B's verdict: {d:?}");
                             seen.0 += 1;
                         } else if p == fp_b {
-                            assert_eq!(v, "allow", "policy B named with A's verdict");
+                            assert_eq!(v, "allow", "policy B named with A's verdict: {d:?}");
                             seen.1 += 1;
                         } else {
                             panic!("a decision named a policy that was never installed: {p}");

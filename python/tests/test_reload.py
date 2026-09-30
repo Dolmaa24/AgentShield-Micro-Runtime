@@ -292,6 +292,11 @@ def test_judgments_racing_reloads_are_always_wholly_one_policy(workspace: Path) 
         def evaluate() -> None:
             while not stop.is_set():
                 d = engine.decide("echo hi")
+                # A decision that ran out of the gate's 10 ms budget fails closed
+                # whatever the rules say: a latency event under this test's
+                # deliberate contention, not a policy mix-up.
+                if not d.complete:
+                    continue
                 seen.add(d.policy)
                 expected = {fp_plain: "allow", fp_deny: "deny"}.get(d.policy)
                 if expected is None:

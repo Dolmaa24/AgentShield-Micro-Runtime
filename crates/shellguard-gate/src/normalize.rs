@@ -57,6 +57,25 @@ pub struct Cmd {
     /// Without this a report says "denied: rm" about a command whose text
     /// contains no `rm`, and the reader has to reverse-engineer why.
     pub via: Option<&'static str>,
+    /// This command exists to run another one (`timeout 5 ls`, `sudo`, `find
+    /// -exec`, `bash -c`), and the command it runs was collected separately.
+    ///
+    /// Such a node is judged through what it wraps, so it is not asked "did a
+    /// rule speak for you?" — `timeout` alone matching nothing says nothing about
+    /// `timeout 5 rm -rf /`, and a default verdict on the wrapper would make every
+    /// wrapped `ls` a `confine`.
+    pub wrapper: bool,
+}
+
+impl Cmd {
+    /// Whether this command causes something to run.
+    ///
+    /// A bare `FOO=bar` executes nothing. A command whose program cannot be
+    /// named (`$CMD args`) does execute something — it just cannot be known
+    /// which — and must not be mistaken for the harmless case.
+    pub fn executes(&self) -> bool {
+        self.program.is_some() || self.opacity != Opacity::Transparent
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -92,8 +111,9 @@ impl<'a> Collector<'a> {
 
             Node::Simple(s) => {
                 let cmd = self.simple_to_cmd(s, ctx);
+                let at = out.len();
                 out.push(cmd);
-                self.collect_unwrapped(s, ctx, out);
+                out[at].wrapper = self.collect_unwrapped(s, ctx, out);
                 // Substitutions inside words are commands in their own right.
                 for w in &s.words {
                     self.collect_word_subs(w, ctx, out);
@@ -207,14 +227,16 @@ impl<'a> Collector<'a> {
     /// Recursion is bounded and the bound is reported, because `sudo env nice
     /// timeout 5 sh -c '...'` is a real shape and so is a chain built purely to
     /// exhaust the limit.
-    fn collect_unwrapped(&mut self, s: &Simple, ctx: Ctx, out: &mut Vec<Cmd>) {
+    ///
+    /// Returns whether `s` is a wrapper at all, so the caller can mark it.
+    fn collect_unwrapped(&mut self, s: &Simple, ctx: Ctx, out: &mut Vec<Cmd>) -> bool {
         let unwrapped = unwrap_wrapper(s);
         if unwrapped.is_empty() {
-            return;
+            return false;
         }
         if ctx.wrap_depth >= self.max_unwrap_depth {
             self.unwrap_truncated = true;
-            return;
+            return true;
         }
         let inner = Ctx { nested: ctx.nested, wrap_depth: ctx.wrap_depth + 1 };
 
@@ -233,8 +255,9 @@ impl<'a> Collector<'a> {
                     let mut cmd = self.simple_to_cmd(&synthetic, inner);
                     cmd.synthetic = true;
                     cmd.via = Some(via);
+                    let at = out.len();
                     out.push(cmd);
-                    self.collect_unwrapped(&synthetic, inner, out);
+                    out[at].wrapper = self.collect_unwrapped(&synthetic, inner, out);
                     for w in &synthetic.words {
                         self.collect_word_subs(w, inner, out);
                     }
@@ -266,6 +289,7 @@ impl<'a> Collector<'a> {
                 }
             }
         }
+        true
     }
 
     fn collect_word_subs(&mut self, w: &Word, ctx: Ctx, out: &mut Vec<Cmd>) {
