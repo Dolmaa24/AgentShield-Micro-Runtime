@@ -37,6 +37,7 @@
 //! commands in a Linux VM through Virtualization.framework rather than trust
 //! Seatbelt to be equivalent. See DESIGN.md § 6.
 
+mod landlock_abi;
 mod profile;
 mod syscalls;
 

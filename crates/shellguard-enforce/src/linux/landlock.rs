@@ -27,6 +27,8 @@
 use std::ffi::{c_char, c_int, c_long, c_void, CString};
 use std::path::Path;
 
+pub use crate::landlock_abi::handled_net_for_abi;
+use crate::landlock_abi::net_rights_to_handle;
 use crate::profile::{Access, EnforceError, Profile};
 
 const SYS_LANDLOCK_CREATE_RULESET: c_long = 444;
@@ -57,10 +59,6 @@ const FS_REFER: u64 = 1 << 13;
 const FS_TRUNCATE: u64 = 1 << 14;
 /// ABI 5: ioctls on device files.
 const FS_IOCTL_DEV: u64 = 1 << 15;
-
-/// ABI 4: outbound TCP.
-const NET_BIND_TCP: u64 = 1 << 0;
-const NET_CONNECT_TCP: u64 = 1 << 1;
 
 const O_PATH: c_int = 0o10000000;
 const O_CLOEXEC: c_int = 0o2000000;
@@ -140,14 +138,6 @@ pub fn handled_fs_for_abi(abi: u32) -> u64 {
     fs
 }
 
-pub fn handled_net_for_abi(abi: u32) -> u64 {
-    if abi >= 4 {
-        NET_BIND_TCP | NET_CONNECT_TCP
-    } else {
-        0
-    }
-}
-
 /// Query the kernel's Landlock ABI version.
 pub fn abi_version() -> Result<u32, EnforceError> {
     // SAFETY: the version query takes a null attr and zero size by contract.
@@ -197,7 +187,7 @@ pub fn build_ruleset(p: &Profile) -> Result<(c_int, u32), EnforceError> {
     }
 
     let handled_fs = handled_fs_for_abi(abi);
-    let handled_net = if p.allow_listen && p.allow_network { 0 } else { handled_net_for_abi(abi) };
+    let handled_net = net_rights_to_handle(&p, abi);
 
     let attr = RulesetAttr { handled_access_fs: handled_fs, handled_access_net: handled_net };
     // SAFETY: `attr` is a valid, correctly sized struct that outlives the call.
@@ -268,7 +258,7 @@ pub fn apply(p: &Profile) -> Result<Applied, EnforceError> {
     }
 
     let handled_fs = handled_fs_for_abi(abi);
-    let handled_net = if p.allow_listen && p.allow_network { 0 } else { handled_net_for_abi(abi) };
+    let handled_net = net_rights_to_handle(&p, abi);
 
     let attr = RulesetAttr { handled_access_fs: handled_fs, handled_access_net: handled_net };
     // SAFETY: `attr` is a valid, correctly sized struct that outlives the call.
@@ -383,6 +373,7 @@ fn add_path(ruleset_fd: c_int, path: &Path, rights: u64) -> Result<(), EnforceEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::landlock_abi::{NET_BIND_TCP, NET_CONNECT_TCP};
 
     #[test]
     fn write_access_contains_read_access() {

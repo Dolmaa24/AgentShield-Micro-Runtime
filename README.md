@@ -146,7 +146,9 @@ Allow  <  Confine  <  Ask  <  Deny
 They combine by **severity, not declaration order**, so no broad allow can
 outrank a narrow deny. The default for an unmatched command is `Confine`, not
 `Allow` — "no rule matched" means the ruleset had nothing to say, which for
-agent-authored input is the common case rather than evidence of safety.
+agent-authored input is the common case rather than evidence of safety. It is
+applied to **each command** on the line, so an unknown program cannot be hidden
+behind an allowed one (`some-tool; ls` is a `confine`, not an `allow`).
 
 ## Checkpoint and rollback
 
@@ -326,7 +328,8 @@ crates/shellguard-enforce   Seatbelt / Landlock + seccomp
 crates/shellguard-ffi       C ABI
 crates/shellguard-cli       eval, corpus, bench, profile
 policies/default.policy     the built-in ruleset
-tests/corpus.txt            145 commands with expected verdicts
+tests/corpus.txt            169 commands with expected verdicts
+tests/exfiltration.txt      what stops each command from sending data out
 ```
 
 **Zero external dependencies**, about 10 400 lines. Deliberate: this is a
@@ -338,17 +341,20 @@ unaudited code execution. The trade-off is discussed honestly in
 ## Development
 
 ```bash
-cargo test                  # 195 tests
+cargo test                  # 488 tests
 cargo clippy --all-targets  # clean
 cargo fmt --check
 ```
 
-The Linux backend cannot run here but must keep compiling:
+The Linux backend cannot run here but must keep compiling — and linting:
 
 ```bash
-cargo check -p shellguard-enforce --target x86_64-unknown-linux-gnu
-cargo check -p shellguard-enforce --target aarch64-unknown-linux-gnu
+cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu
+cargo clippy --workspace --all-targets --target aarch64-unknown-linux-gnu
 ```
+
+That checks it type-checks, not that it works; see [DESIGN.md § 12](DESIGN.md#12-known-limitations)
+for what has never run on Linux.
 
 `tests/corpus.txt` is the specification, kept separate from the rules that
 implement it. If a policy change moves an entry, decide whether that is a fix

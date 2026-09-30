@@ -296,7 +296,7 @@ impl Engine {
     /// the workspace readable and writable, and nothing else, no network.
     /// Narrower profiles still come from rules that actually recognised the
     /// command, and `Allow` verdicts keep whatever the matching rule granted.
-    fn profile_for(&self, decision: &Decision) -> Profile {
+    pub fn profile_for(&self, decision: &Decision) -> Profile {
         let mut profile = Profile::from_capabilities(&self.workspace, &decision.capabilities);
         if decision.verdict >= Verdict::Confine && profile.writable().is_empty() {
             profile.write_paths.push(self.workspace.clone());
