@@ -36,7 +36,7 @@ mod unwrap;
 
 pub use config::GateConfig;
 pub use decision::{CommandSummary, Decision, Finding, Incomplete};
-pub use gate::{Gate, Worker, DEFAULT_DEADLINE};
+pub use gate::{Gate, Worker, DEFAULT_DEADLINE, LATENCY_BUDGET};
 pub use normalize::{Arg, Cmd};
 pub use reload::{ReloadError, ReloadMode, ReloadReport};
 pub use resolve::{lexical_normalize, looks_like_path, PathCache, PathClass};
@@ -262,6 +262,39 @@ mod tests {
         let d = gate().evaluate_once("some-unknown-tool --flag");
         assert_eq!(d.verdict, Verdict::Confine);
         assert!(d.findings.is_empty());
+    }
+
+    // ------------------------------------------------- the deadline and the budget
+
+    #[test]
+    fn the_default_config_uses_the_default_deadline_and_not_a_copy_of_it() {
+        // The two used to be independent literals, and a constant that nothing
+        // reads is a constant that drifts.
+        assert_eq!(GateConfig::default().deadline, DEFAULT_DEADLINE);
+        assert_eq!(GateConfig::from_env("/tmp").deadline, DEFAULT_DEADLINE);
+    }
+
+    #[test]
+    fn the_deadline_is_a_safety_valve_well_above_the_latency_budget() {
+        // The budget is what the project promises and `bench` asserts. The
+        // deadline is where the gate gives up and denies; if it sat at the budget
+        // it would fire on scheduling noise, not on adversarial input.
+        assert_eq!(LATENCY_BUDGET, std::time::Duration::from_millis(10));
+        assert!(DEFAULT_DEADLINE >= LATENCY_BUDGET * 10, "{DEFAULT_DEADLINE:?}");
+    }
+
+    #[test]
+    fn a_deadline_still_fails_closed_whatever_its_length() {
+        // Raising the default must not have weakened what happens when it fires.
+        let cfg = GateConfig {
+            workspace: std::env::temp_dir(),
+            cwd: std::env::temp_dir(),
+            deadline: std::time::Duration::from_nanos(1),
+            ..GateConfig::default()
+        };
+        let d = Gate::with_default_policy(cfg).evaluate_once("ls");
+        assert_eq!(d.verdict, Verdict::Deny);
+        assert!(matches!(d.incomplete, Some(Incomplete::Deadline { .. })));
     }
 
     // ------------------------------------------- the default is per command

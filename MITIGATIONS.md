@@ -352,7 +352,7 @@ embedders can make.
 ### 20. The irreducible risk: the gate can be wrong, a kernel bug is a full escape, rollback doesn't undo side effects
 
 **Status: the verification task is built and macOS is verified; the answer it gave
-is uncomfortable, and four fixes are decisions rather than code.** Design and
+is uncomfortable, and three fixes are decisions rather than code.** Design and
 evidence are in [DESIGN.md § 16](DESIGN.md#16-what-stops-a-command-from-sending-data-out).
 
 Built: `tests/exfiltration.txt` and its harness, with three classes (`blocked`,
@@ -372,8 +372,11 @@ was `allow`; `git remote add` was allowed as inspection; and Landlock denied
 |---|---|
 | Linux: "no network" is TCP only; UDP and Unix sockets are open (read from code, never run) | the fix is a seccomp filter on `socket()`, a user+network namespace, or routing risky commands to gVisor. The first cannot be tested off-Linux; the second fails on hardened kernels |
 | macOS: `(allow mach-lookup)` leaves LaunchServices, the keychain server, the clipboard and the URL agent reachable | needs an allowlist of what tools really use; a naive deny of LaunchServices breaks `git`, `python3`, `perl`, `curl` |
-| the gate's 10 ms wall-clock deadline denies benign commands on a busy machine | raising it changes the headline claim |
 | `git branch -D`/`tag -d` are `allow`; the gate does not follow `cd` | need a policy-language predicate and a change to path tracking |
+
+**Decided and done:** the gate's deadline is now 100 ms, separate from the 10 ms
+latency budget it used to share a number with. See DESIGN.md § 5 and § 12 for the
+evidence, and for what it does *not* demonstrate.
 
 The compensating controls the original entry describes still stand; this entry now
 also measures how far they reach.

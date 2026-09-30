@@ -27,7 +27,8 @@ OPTIONS:
     -w, --workspace DIR    the directory the agent may write to (default: cwd)
     -C, --cwd DIR          resolve relative paths against this (default: the workspace)
     -p, --policy FILE      a policy file (default: the built-in ruleset)
-    -d, --deadline MS      evaluation budget in milliseconds (default: 10)
+    -d, --deadline MS      when evaluation gives up and denies, in milliseconds
+                           (default: 100; `run` uses it as the command's timeout)
     -n, --iterations N     bench iterations over the corpus (default: 200)
         --json             machine-readable output (eval and run)
         --protect PATH     a file that must not change (repeatable; run only)
@@ -587,7 +588,7 @@ fn cmd_bench(o: &Opts) -> Result<ExitCode, String> {
     eprintln!("measuring {} commands x {} iterations ...", commands.len(), iterations);
     let r = bench::run(&gate, &commands, iterations);
 
-    let budget = Duration::from_millis(10);
+    let budget = shellguard_gate::LATENCY_BUDGET;
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "\nshellguard evaluation latency");
     let _ = writeln!(

@@ -102,6 +102,14 @@ Percentiles rather than a mean, because the claim is a budget: a mean of 200 µs
 is consistent with one command in a thousand taking 50 ms, and an adversary
 picks the input.
 
+Two numbers, kept apart: the **budget** (10 ms) is the latency this project
+promises and `shellguard bench` asserts; the **deadline** (100 ms, `-d`) is where
+the gate gives up and denies. The deadline is a safety valve against input built
+to be slow — the worst measured takes about 2 ms — and is ten times the budget
+because it is wall-clock time, which also counts every moment the process was not
+scheduled. At 10 ms it refused an innocent `basename $(pwd)` after a 30 ms stall
+on a busy machine.
+
 ## What it catches
 
 Every one of these is the same delete wearing a different program's name, and

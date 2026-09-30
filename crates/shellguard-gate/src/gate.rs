@@ -330,5 +330,21 @@ fn arg_facts(a: &crate::normalize::Arg) -> ArgFacts<'_> {
     }
 }
 
-/// The gate's evaluation budget, exposed for callers that want to report it.
-pub const DEFAULT_DEADLINE: Duration = Duration::from_millis(10);
+/// The latency the project promises, and what `shellguard bench` holds it to.
+///
+/// A target for how long evaluation *takes*. It is not the point at which the gate
+/// gives up; that is [`DEFAULT_DEADLINE`].
+pub const LATENCY_BUDGET: Duration = Duration::from_millis(10);
+
+/// How long one evaluation may run before the gate gives up and denies.
+///
+/// A safety valve, not the budget. It exists so that adversarial input cannot make
+/// evaluation slow enough to be a bypass, and the worst such input measured takes
+/// about 2 ms. It is ten times [`LATENCY_BUDGET`] because it is wall-clock time:
+/// it also counts every moment the thread was not scheduled. Set equal to the
+/// budget it fired on ordinary commands whenever the machine was busy or the
+/// process was cold — measured at 1 in 414 identical evaluations, with a 30 ms
+/// overrun on a benign `basename $(pwd)` — and a refusal of something innocent is a
+/// cost paid by the operator every time it happens. Typical evaluation is a few
+/// microseconds either way.
+pub const DEFAULT_DEADLINE: Duration = Duration::from_millis(100);

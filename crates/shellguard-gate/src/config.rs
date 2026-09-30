@@ -47,7 +47,7 @@ impl Default for GateConfig {
             cwd: PathBuf::from("."),
             home: None,
             path: default_path(),
-            deadline: Duration::from_millis(10),
+            deadline: crate::gate::DEFAULT_DEADLINE,
             limits: Limits::default(),
             max_unwrap_depth: 4,
             on_timeout: Verdict::Deny,
