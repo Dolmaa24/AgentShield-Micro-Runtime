@@ -1275,3 +1275,82 @@ install` and package installs (their own rules); a destination that is not known
 before the command runs (`cp x "$OUT"`) is not escalated; and a symlink inside the
 workspace that points at a system directory makes a write through it `ask`, not
 `deny`, because the system check does not follow links.
+
+## 19. Wrapping a whole agent
+
+Everything before this section judges and confines one command. That protects
+nothing an agent does without going through it — its own file-editing tools, a
+setting changed, a hook removed (MITIGATIONS #8, #10, #14). The decision, made by the
+user against three alternatives, was to confine the **agent itself**: `shellguard
+shell -- <agent>` runs it and everything it starts under one Seatbelt profile.
+
+**Why that and not a per-command layer underneath it.** Measured first: on macOS a
+sandboxed process cannot apply a different profile — `sandbox-exec` or `sandbox_init`
+with anything other than the profile already in force is refused (`sandbox_apply:
+Operation not permitted`). So "wrap the agent" and "sandbox each command" cannot both
+be kernel-enforced at once on a Mac. The session is the boundary; a test pins the
+refusal so it is noticed if a macOS release lifts it.
+
+**The shape is the opposite of a command's** (`AgentProfile`):
+
+| | per command | whole session |
+|---|---|---|
+| reads | system runtime and the workspace | everything, except 29 places that hold secrets |
+| writes | the workspace, if granted | the workspace, the agent's state, a private temp dir |
+| network | only if a rule granted it | outbound, and listening on localhost |
+| Mach services | an allowlist of two | the same allowlist |
+
+**SBPL precedence, measured** (`sbpl_precedence_is_what_the_profiles_rely_on`): a
+rule with a filter beats one without, in either order; among rules with filters the
+last match wins. The secret denial therefore beats the open read wherever it stands,
+but `.git/hooks` must be frozen *after* the workspace grant — before it, the grant
+wins and hooks are writable (a mutant proved it).
+
+**What the real agents needed, found by running them** (with the user's approval, on
+their accounts, in a scratch workspace):
+
+- *Codex* loads TLS roots through the Keychain, which a session cannot read; every
+  request failed after the TCP connect. With `SSL_CERT_FILE=/etc/ssl/cert.pem` — now
+  the session default — the sandboxed run got the same answer from the server as an
+  unsandboxed one. `configd` and an `AF_SYSTEM` socket were refused too and turned
+  out not to matter.
+- *Codex* also sandboxes its own commands with Seatbelt, which cannot nest; inside a
+  session it must run with `--sandbox danger-full-access`, and the CLI says so.
+- *Claude Code* keeps its login in the Keychain. Reading it needs the Keychain's
+  services and files; refreshing an expired token needs to *write* the login
+  keychain. The user chose to keep the Keychain sealed and authenticate with
+  `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`; the CLI says so when it is
+  missing. Claude also writes a version lock under `~/.local/state/claude`, now in its
+  preset.
+
+**Closing the other doors.** Sealing secret files while leaving secrets elsewhere
+would be sealing one door of two:
+
+- environment variables whose names look like credentials are removed, except the
+  agent's own, and the banner names each one removed;
+- the SSH agent is unreachable (launchd's socket by pattern, plus whatever
+  `SSH_AUTH_SOCK` names) — with `~/.ssh` unreadable it was the remaining way to use
+  the keys;
+- container daemons' sockets are unreachable (Docker Desktop, OrbStack, Colima, Lima,
+  Rancher, Podman, `DOCKER_HOST`): a daemon that will run `-v /:/host` for any client
+  is a way out of every rule here, and a socket connect is not a write. The kernel
+  checks a socket's *resolved* path, so `/var/run/docker.sock` is blocked by its
+  target — and a symlink whose target does not exist yet (the daemon is not running)
+  is followed to where the socket will be.
+
+**Red-teamed with a stand-in agent**, each against a canary and with an unsandboxed
+control: writes, deletes and renames outside; writes through a hard link and a
+symlink; `launchctl submit`; `defaults write` (cfprefsd writes for the client);
+`osascript do shell script`; `open` (LaunchServices). All held.
+
+**Not done, and why.** A full real-agent session — the red-team prompt that asks
+Claude and Codex, with permissions bypassed, to write and delete outside the
+workspace and read a canary marked secret — could not run: both CLI logins on the
+test machine were expired (Codex refused even unsandboxed). It is the next thing to
+run once they are renewed. Outbound network is open, so a session limits what can be
+changed, not what can be sent. Persistence inside the workspace beyond `.git/hooks` —
+`.git/config` keys that run programs, `package.json` scripts, a `Makefile`, `.envrc`
+— is writable, and runs when the person next uses the project outside a session.
+Linux is not built: Landlock grants access and cannot take it back, so a readable home
+with unreadable secrets in it cannot be expressed. Claude Code's own sandbox setting,
+if enabled, would fail to nest the same way Codex's does.

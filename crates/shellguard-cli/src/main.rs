@@ -2,6 +2,7 @@
 
 mod bench;
 mod corpus;
+mod shell;
 
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -21,6 +22,8 @@ USAGE:
     shellguard corpus  [OPTIONS] [FILE]        check the ruleset against expectations
     shellguard bench   [OPTIONS] [FILE]        measure evaluation latency
     shellguard rules                           list the loaded ruleset
+    shellguard shell   [OPTIONS] -- <program>  run an agent session confined to the
+                                               workspace (`shellguard shell --help`)
 
 OPTIONS:
     -w, --workspace DIR    the directory the agent may write to (default: cwd)
@@ -96,6 +99,13 @@ fn run() -> Result<ExitCode, String> {
             std::env::consts::OS
         );
         return Ok(ExitCode::SUCCESS);
+    }
+
+    // `shell` passes everything after the program to it untouched, so it does
+    // not go through the common option parser, which would reject the agent's
+    // own flags.
+    if command == "shell" {
+        return shell::cmd_shell(args);
     }
 
     let opts = parse_opts(args)?;

@@ -30,6 +30,7 @@
 use std::ffi::{c_char, c_int, CString};
 use std::path::Path;
 
+use crate::agent::AgentProfile;
 use crate::profile::{Access, EnforceError, Profile};
 
 /// Directories a process needs to read for `dyld` to load it at all.
@@ -278,6 +279,188 @@ pub fn profile_sbpl(p: &Profile) -> Result<String, EnforceError> {
     }
 
     Ok(s)
+}
+
+/// A path as SBPL will see it: through any symlink in the part that exists, so
+/// `/var/folders/...` matches the kernel's `/private/var/folders/...`. The part
+/// that does not exist yet is kept as written.
+fn real(p: &Path) -> std::path::PathBuf {
+    real_within(p, 16)
+}
+
+/// [`real`], following at most `hops` symlinks whose targets do not exist yet:
+/// `/var/run/docker.sock` names `~/.docker/run/docker.sock` before the daemon
+/// that creates it has started, and a rule about the socket must name where it
+/// will be.
+fn real_within(p: &Path, hops: u8) -> std::path::PathBuf {
+    if let Ok(c) = p.canonicalize() {
+        return c;
+    }
+    if hops > 0 {
+        if let Ok(target) = std::fs::read_link(p) {
+            let next = match p.parent() {
+                Some(parent) if target.is_relative() => parent.join(target),
+                _ => target,
+            };
+            return real_within(&next, hops - 1);
+        }
+    }
+    match (p.parent(), p.file_name()) {
+        (Some(parent), Some(name)) if parent != p => real_within(parent, hops).join(name),
+        _ => p.to_path_buf(),
+    }
+}
+
+/// A path as an anchored SBPL regular expression matching it and anything that
+/// begins with it.
+fn sbpl_prefix_regex(p: &Path) -> Result<String, EnforceError> {
+    let s = p.to_str().ok_or_else(|| EnforceError::Rejected {
+        stage: "profile generation",
+        detail: format!("path is not valid UTF-8: {p:?}"),
+    })?;
+    let mut out = String::from("#\"^");
+    for c in s.chars() {
+        match c {
+            '"' => {
+                return Err(EnforceError::Rejected {
+                    stage: "profile generation",
+                    detail: format!("path contains a quote: {s:?}"),
+                })
+            }
+            c if c.is_control() => {
+                return Err(EnforceError::Rejected {
+                    stage: "profile generation",
+                    detail: format!("path contains a control character: {s:?}"),
+                })
+            }
+            '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    Ok(out)
+}
+
+/// Compile a whole-session profile to SBPL. The shape — reads open except
+/// secrets, writes closed except the workspace and the agent's state — is
+/// explained on [`AgentProfile`].
+///
+/// How SBPL picks between rules, measured rather than assumed (and pinned by
+/// `sbpl_precedence_is_what_the_profiles_rely_on`): a rule with a filter beats
+/// one without, in either order; among rules with filters, the last that
+/// matches wins. So the secret denial overrides the open read wherever it
+/// stands, but the frozen directories must come *after* the workspace grant —
+/// placed before it, the grant would win and `.git/hooks` would be writable.
+pub fn agent_sbpl(p: &AgentProfile) -> Result<String, EnforceError> {
+    let mut s = String::with_capacity(4096);
+    s.push_str("(version 1)\n");
+    s.push_str("(deny default)\n");
+
+    s.push_str("(allow file-read*)\n");
+    if !p.secret_dirs.is_empty() {
+        // Contents and listings, not existence: denying `stat` breaks tools that
+        // only check whether a directory is there.
+        s.push_str("(deny file-read-data file-read-xattr\n");
+        for d in &p.secret_dirs {
+            s.push_str(&format!("  (subpath {})\n", path_string(&real(d))?));
+        }
+        s.push_str(")\n");
+    }
+
+    s.push_str("(allow file-write*\n");
+    s.push_str(&format!("  (subpath {})\n", path_string(&real(&p.workspace))?));
+    for d in &p.write_dirs {
+        s.push_str(&format!("  (subpath {})\n", path_string(&real(d))?));
+    }
+    for f in &p.write_prefixes {
+        s.push_str(&format!("  (regex {})\n", sbpl_prefix_regex(&real(f))?));
+    }
+    for dev in ["/dev/null", "/dev/zero", "/dev/tty", "/dev/ptmx", "/dev/dtracehelper"] {
+        s.push_str(&format!("  (literal {})\n", sbpl_string(dev)?));
+    }
+    s.push_str("  (regex #\"^/dev/ttys[0-9]+$\")\n");
+    s.push_str(")\n");
+    if !p.frozen_dirs.is_empty() {
+        s.push_str("(deny file-write*\n");
+        for d in &p.frozen_dirs {
+            s.push_str(&format!("  (subpath {})\n", path_string(&real(d))?));
+        }
+        s.push_str(")\n");
+    }
+
+    // A terminal: the agent is interactive, and the tools it runs open ptys.
+    s.push_str(
+        "(allow file-ioctl (literal \"/dev/tty\") (literal \"/dev/ptmx\") \
+         (literal \"/dev/dtracehelper\") (regex #\"^/dev/ttys[0-9]+$\"))\n",
+    );
+    s.push_str("(allow pseudo-tty)\n");
+    s.push_str("(allow process-exec)\n");
+    s.push_str("(allow process-fork)\n");
+    s.push_str("(allow sysctl-read)\n");
+    // The agent stops what it started; nothing else.
+    s.push_str("(allow signal (target same-sandbox))\n");
+
+    let mut services: Vec<&str> = MACH_SERVICES_BASE.to_vec();
+    if p.allow_network {
+        services.extend_from_slice(MACH_SERVICES_NETWORK);
+    }
+    for m in &p.mach_services {
+        if !services.contains(&m.as_str()) {
+            services.push(m);
+        }
+    }
+    s.push_str(&mach_rule(&services)?);
+
+    if p.allow_network {
+        s.push_str("(allow network-outbound)\n");
+    }
+    if p.allow_local_listen {
+        s.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
+        s.push_str("(allow network-inbound (local ip \"localhost:*\"))\n");
+    }
+    if p.block_ssh_agent || !p.blocked_sockets.is_empty() || !p.blocked_socket_dirs.is_empty() {
+        // The kernel checks the socket's resolved path, so each is named as it
+        // resolves: blocking a symlink's own path blocks nothing (measured).
+        s.push_str("(deny network-outbound\n");
+        for d in &p.blocked_socket_dirs {
+            let mut under = real(d);
+            under.push("");
+            s.push_str(&format!(
+                "  (remote unix-socket (path-regex {}))\n",
+                sbpl_prefix_regex(&under)?
+            ));
+        }
+        if p.block_ssh_agent {
+            // The socket launchd creates for the SSH agent, whatever its id.
+            s.push_str(
+                "  (remote unix-socket (path-regex \
+                 #\"^/private/var/run/com\\.apple\\.launchd\\.[^/]+/Listeners$\"))\n",
+            );
+        }
+        for sock in &p.blocked_sockets {
+            s.push_str(&format!(
+                "  (remote unix-socket (path-literal {}))\n",
+                path_string(&real(sock))?
+            ));
+        }
+        s.push_str(")\n");
+    }
+    Ok(s)
+}
+
+/// An argv that runs `program` for a whole session under `p`.
+pub fn agent_command(
+    p: &AgentProfile,
+    program: &str,
+    args: &[String],
+) -> Result<Vec<String>, EnforceError> {
+    let mut argv = vec!["/usr/bin/sandbox-exec".to_string(), "-p".to_string(), agent_sbpl(p)?];
+    argv.push(program.to_string());
+    argv.extend(args.iter().cloned());
+    Ok(argv)
 }
 
 /// Build an argv that runs `program` under this profile via `sandbox-exec`.
@@ -737,5 +920,286 @@ mod tests {
         // /etc/passwd is world-readable and outside every granted subpath.
         let out = run_confined(&p, "cat /etc/passwd > /dev/null");
         assert!(!out.status.success(), "a read outside the profile succeeded");
+    }
+}
+
+#[cfg(test)]
+mod agent_session_tests {
+    //! A whole agent session, against the real kernel, with a stand-in agent.
+    //!
+    //! The agent is a shell and the processes it starts, in a fixture with a fake
+    //! home directory, so nothing here can touch the real one. Each refusal is
+    //! paired with an unsandboxed control showing the same action succeeds when
+    //! nothing stops it — otherwise "refused" could mean "broken".
+
+    use super::*;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    struct Fixture {
+        root: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Fixture {
+            let root = std::env::temp_dir()
+                .join(format!("shellguard-agent-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            for d in ["ws/.git/hooks", "home/.ssh", "home/.claude", "outside", "tmp"] {
+                std::fs::create_dir_all(root.join(d)).unwrap();
+            }
+            std::fs::write(root.join("home/.ssh/id_rsa"), "PRIVATE KEY").unwrap();
+            std::fs::write(root.join("home/notes.txt"), "notes").unwrap();
+            std::fs::write(root.join("outside/keep.txt"), "keep").unwrap();
+            std::fs::write(root.join("ws/f.txt"), "f").unwrap();
+            Fixture { root: root.canonicalize().unwrap() }
+        }
+        fn p(&self, rel: &str) -> PathBuf {
+            self.root.join(rel)
+        }
+        fn profile(&self) -> AgentProfile {
+            AgentProfile::for_program("claude", &self.p("ws"), &self.p("home"), &self.p("tmp"))
+        }
+        /// (exit status, stdout+stderr) of `script`, sandboxed or not.
+        fn run(&self, script: &str, sandboxed: bool) -> (bool, String) {
+            let mut c = if sandboxed {
+                let argv = agent_command(&self.profile(), "/bin/sh", &["-c".into(), script.into()])
+                    .unwrap();
+                let mut c = Command::new(&argv[0]);
+                c.args(&argv[1..]);
+                c
+            } else {
+                let mut c = Command::new("/bin/sh");
+                c.args(["-c", script]);
+                c
+            };
+            let out = c
+                .current_dir(self.p("ws"))
+                .env("HOME", self.p("home"))
+                .env("TMPDIR", self.p("tmp"))
+                .env("OUT", self.p("outside"))
+                .output()
+                .expect("spawn");
+            let text = String::from_utf8_lossy(&out.stdout).into_owned()
+                + &String::from_utf8_lossy(&out.stderr);
+            (out.status.success(), text)
+        }
+        /// `script` works without the sandbox and fails inside it.
+        fn refused(&self, script: &str) {
+            let (ok, out) = self.run(script, false);
+            assert!(ok, "control failed, so the test proves nothing: {script}\n{out}");
+            self.reset();
+            let (ok, out) = self.run(script, true);
+            assert!(!ok, "the session allowed: {script}\n{out}");
+        }
+        fn allowed(&self, script: &str) {
+            let (ok, out) = self.run(script, true);
+            assert!(ok, "the session refused: {script}\n{out}");
+        }
+        /// Put back whatever an unsandboxed control changed.
+        fn reset(&self) {
+            let _ = std::fs::write(self.p("home/notes.txt"), "notes");
+            let _ = std::fs::write(self.p("outside/keep.txt"), "keep");
+            let _ = std::fs::remove_file(self.p("outside/new.txt"));
+            let _ = std::fs::remove_file(self.p("ws/.git/hooks/pre-commit"));
+            let _ = std::fs::remove_dir_all(self.p("home/newdir"));
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn nothing_outside_the_workspace_is_written_by_the_agent_or_anything_it_starts() {
+        let fx = Fixture::new("writes");
+        for script in [
+            "echo x > \"$OUT/new.txt\"",
+            "echo changed > \"$OUT/keep.txt\"",
+            "rm \"$OUT/keep.txt\"",
+            "echo changed > \"$HOME/notes.txt\"",
+            "mkdir \"$HOME/newdir\"",
+            "mv f.txt \"$OUT/\"",
+            // Two and three processes down: what the agent runs, and what that runs.
+            "bash -c 'echo x > \"$OUT/new.txt\"'",
+            "python3 -c 'import os; open(os.environ[\"OUT\"]+\"/new.txt\",\"w\").write(\"x\")'",
+            "sh -c \"bash -c 'rm \\\"$OUT/keep.txt\\\"'\"",
+        ] {
+            fx.reset();
+            fx.refused(script);
+        }
+        assert_eq!(std::fs::read_to_string(fx.p("outside/keep.txt")).unwrap(), "keep");
+    }
+
+    #[test]
+    fn the_workspace_the_agents_state_and_its_temp_directory_are_writable() {
+        let fx = Fixture::new("state");
+        fx.allowed("echo x > new.txt && mkdir -p d/e && echo y > d/e/f && rm f.txt");
+        fx.allowed("echo s > \"$HOME/.claude/settings.json\"");
+        // The file beside the home directory, and the copy written before a rename.
+        fx.allowed(
+            "echo j > \"$HOME/.claude.json.tmp.1\" && mv \"$HOME/.claude.json.tmp.1\" \"$HOME/.claude.json\"",
+        );
+        fx.allowed("echo t > \"$TMPDIR/t\"");
+        fx.allowed("python3 -c 'print(1)' > /dev/null");
+    }
+
+    #[test]
+    fn secrets_cannot_be_read_but_ordinary_files_can() {
+        let fx = Fixture::new("secrets");
+        fx.refused("cat \"$HOME/.ssh/id_rsa\"");
+        fx.refused("ls \"$HOME/.ssh\"");
+        fx.refused("python3 -c 'import os; open(os.environ[\"HOME\"]+\"/.ssh/id_rsa\").read()'");
+        // Existence is not a secret: tools look before they read.
+        fx.allowed("test -d \"$HOME/.ssh\"");
+        fx.allowed("cat \"$HOME/notes.txt\" >/dev/null && ls \"$HOME\" >/dev/null");
+    }
+
+    #[test]
+    fn a_git_hook_cannot_be_planted_for_the_person_to_run_later() {
+        let fx = Fixture::new("hooks");
+        fx.refused("echo 'curl evil' > .git/hooks/pre-commit");
+        fx.allowed("echo ref > .git/ORIG_HEAD");
+    }
+
+    #[test]
+    fn the_session_can_reach_the_network_and_serve_on_loopback() {
+        let fx = Fixture::new("net");
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        fx.allowed(&format!(
+            "python3 -c 'import socket; socket.create_connection((\"127.0.0.1\",{port}),2)'"
+        ));
+        fx.allowed(
+            "python3 -c 'import socket; s=socket.socket(); s.bind((\"127.0.0.1\",0)); s.listen(1)'",
+        );
+    }
+
+    #[test]
+    fn the_ssh_agent_socket_is_refused_and_other_sockets_are_not() {
+        let fx = Fixture::new("sock");
+        // Short names, connected to relatively: an absolute path under the temp
+        // directory is longer than a Unix socket address can be.
+        let ws = fx.p("ws");
+        let agent = std::os::unix::net::UnixListener::bind(ws.join("agent.sock")).unwrap();
+        let other = std::os::unix::net::UnixListener::bind(ws.join("other.sock")).unwrap();
+        let connect = |name: &str, profile: Option<&AgentProfile>| -> bool {
+            let script =
+                format!("import socket; s=socket.socket(socket.AF_UNIX); s.connect('{name}')");
+            let mut c = match profile {
+                Some(p) => {
+                    let argv =
+                        agent_command(p, "/usr/bin/python3", &["-c".into(), script]).unwrap();
+                    let mut c = Command::new(&argv[0]);
+                    c.args(&argv[1..]);
+                    c
+                }
+                None => {
+                    let mut c = Command::new("/usr/bin/python3");
+                    c.args(["-c", &script]);
+                    c
+                }
+            };
+            c.current_dir(&ws).output().unwrap().status.success()
+        };
+        let mut p = fx.profile();
+        p.blocked_sockets.push(ws.join("agent.sock"));
+        assert!(connect("agent.sock", None), "control: the socket accepts unsandboxed");
+        assert!(!connect("agent.sock", Some(&p)), "the session reached the blocked agent socket");
+        assert!(connect("other.sock", Some(&p)), "an unrelated socket was refused too");
+        drop((agent, other));
+    }
+
+    #[test]
+    fn a_container_daemon_socket_is_refused_wherever_the_runtime_keeps_it() {
+        let fx = Fixture::new("docker");
+        let ws = fx.p("ws");
+        std::fs::create_dir_all(ws.join("run")).unwrap();
+        let daemon = std::os::unix::net::UnixListener::bind(ws.join("run/d.sock")).unwrap();
+        // Reached through a symlink, as /var/run/docker.sock is.
+        std::os::unix::fs::symlink("run/d.sock", ws.join("docker.sock")).unwrap();
+        let other = std::os::unix::net::UnixListener::bind(ws.join("ok.sock")).unwrap();
+        let mut p = fx.profile();
+        p.blocked_socket_dirs.push(ws.join("run"));
+        let connect = |name: &str| -> bool {
+            let script =
+                format!("import socket; s=socket.socket(socket.AF_UNIX); s.connect('{name}')");
+            let argv = agent_command(&p, "/usr/bin/python3", &["-c".into(), script]).unwrap();
+            Command::new(&argv[0])
+                .args(&argv[1..])
+                .current_dir(&ws)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        assert!(!connect("run/d.sock"), "the daemon's socket was reachable");
+        assert!(!connect("docker.sock"), "the daemon's socket was reachable through a symlink");
+        assert!(connect("ok.sock"), "an unrelated socket was refused");
+        drop((daemon, other));
+    }
+
+    #[test]
+    fn a_symlink_whose_target_does_not_exist_yet_is_named_by_its_target() {
+        let fx = Fixture::new("dangling");
+        std::os::unix::fs::symlink(fx.p("outside/later.sock"), fx.p("ws/link.sock")).unwrap();
+        assert_eq!(real(&fx.p("ws/link.sock")), fx.p("outside/later.sock"));
+    }
+
+    #[test]
+    fn a_command_inside_cannot_be_given_a_narrower_sandbox_on_macos() {
+        // The measured limitation that shapes the design: inside a session, the
+        // per-command sandbox cannot be applied. If this ever starts passing, the
+        // session can layer per-command confinement after all.
+        let fx = Fixture::new("nest");
+        let (ok, out) = fx.run(
+            "/usr/bin/sandbox-exec -p '(version 1)(allow default)(deny network*)' /bin/echo nested",
+            true,
+        );
+        assert!(!ok && out.contains("Operation not permitted"), "{out}");
+    }
+
+    /// The rule precedence the session profile depends on, against the kernel.
+    /// If a macOS release changes it, this fails before a profile quietly stops
+    /// meaning what it says.
+    #[test]
+    fn sbpl_precedence_is_what_the_profiles_rely_on() {
+        let fx = Fixture::new("precedence");
+        let x = fx.p("home/.ssh");
+        let read = |rules: &str| -> bool {
+            let sbpl = format!("(version 1)(allow default){rules}");
+            Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", &sbpl, "/bin/cat"])
+                .arg(x.join("id_rsa"))
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        let d = x.display();
+        // A filtered rule beats an unfiltered one, in either order.
+        assert!(!read(&format!("(allow file-read*)(deny file-read-data (subpath \"{d}\"))")));
+        assert!(!read(&format!("(deny file-read-data (subpath \"{d}\"))(allow file-read*)")));
+        // Among filtered rules, the last match wins.
+        assert!(read(&format!(
+            "(deny file-read-data (subpath \"{d}\"))(allow file-read-data (subpath \"{d}\"))"
+        )));
+        assert!(!read(&format!(
+            "(allow file-read-data (subpath \"{d}\"))(deny file-read-data (subpath \"{d}\"))"
+        )));
+    }
+
+    #[test]
+    fn the_profile_puts_each_exception_after_the_rule_it_narrows() {
+        let fx = Fixture::new("order");
+        let sbpl = agent_sbpl(&fx.profile()).unwrap();
+        let at =
+            |needle: &str| sbpl.find(needle).unwrap_or_else(|| panic!("no `{needle}`:\n{sbpl}"));
+        assert!(at("(allow file-read*)") < at("(deny file-read-data"));
+        assert!(at("(allow file-write*") < at("(deny file-write*"));
+        assert!(sbpl.starts_with("(version 1)\n(deny default)\n"));
+        assert!(!sbpl.lines().any(|l| l.trim() == "(allow mach-lookup)"), "blanket mach-lookup");
     }
 }

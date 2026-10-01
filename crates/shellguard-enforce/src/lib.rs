@@ -37,10 +37,15 @@
 //! commands in a Linux VM through Virtualization.framework rather than trust
 //! Seatbelt to be equivalent. See DESIGN.md § 6.
 
+mod agent;
 mod landlock_abi;
 mod profile;
 mod syscalls;
 
+pub use agent::{
+    agent_credentials, looks_like_credential, AgentProfile, CONTAINER_SOCKET_DIRS, SECRET_DIRS,
+    SECRET_FILES,
+};
 pub use profile::{Access, EnforceError, FsGrant, Profile};
 pub use syscalls::DENIED as DENIED_SYSCALLS;
 

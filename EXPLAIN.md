@@ -180,6 +180,45 @@ accidentally take.
 
 ---
 
+## Running a whole agent inside it
+
+Everything above judges and cages one command at a time. That only helps if every
+command actually goes through it — and an agent like Claude Code or Codex has its
+own ways to change files, its own modes ("ask me first", "auto", "bypass
+permissions"), and settings that can be edited.
+
+So there is a second way to use it: put the **whole agent** in the cage.
+
+```
+shellguard shell -w ~/project -- claude
+```
+
+The difference from the agent's own modes is who does the refusing. An agent's
+permission mode is the agent deciding whether to ask you; in "bypass" it doesn't ask
+at all. Inside `shellguard shell` it's the **operating system** refusing — the agent
+can be in any mode, edit any setting, run any command, and a file outside your
+project still cannot be changed, because the kernel says no. We tried the sneaky
+routes too: hard links, symlinks, scheduling a job with `launchctl`, asking another
+app to do it with AppleScript, writing preferences through the system's preferences
+service. All refused.
+
+What else a session does:
+
+- Your secrets are hidden: `~/.ssh`, `~/.aws`, browser profiles and so on can't be
+  read, and passwords or tokens in your environment are removed before the agent
+  starts (it keeps its own).
+- It can't borrow your SSH keys through the SSH agent, or ask Docker to do something
+  for it (Docker can reach your whole disk).
+- It can't plant a git hook in your project that would run the next time *you*
+  commit.
+
+What it does **not** do: stop the agent sending things over the internet. The agent
+needs the internet to talk to its model, and everything it runs gets the same
+access. So a session protects your files from being changed or deleted; it doesn't
+stop the agent from leaking what it can read in your project.
+
+---
+
 ## What it can't do yet
 
 Being straight about this, because the gaps are real:
@@ -196,6 +235,9 @@ Being straight about this, because the gaps are real:
   tamper with it, but it can be edited by another program running as you, and
   it only knows about commands that went through AgentShield.
 - **No memory or CPU limits** on what a command can consume.
+- **Whole-agent sessions are macOS only**, and have been tested with a stand-in
+  agent and with the real Claude Code and Codex starting up — but not yet with a
+  full real session doing work, because both logins on the test machine had expired.
 - **Swapping rules in a running program is safe, but it isn't magic.** A program
   that's already running can load new rules without restarting, all-or-nothing,
   and a broken or half-saved rules file is refused. Rules that make things

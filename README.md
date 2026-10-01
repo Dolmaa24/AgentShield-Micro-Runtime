@@ -86,6 +86,31 @@ so it is the sandbox `run` would apply, not a reconstruction of it:
 Exit status is the verdict — `0` allow, `1` confine, `2` ask, `3` deny — so it
 drops into a shell wrapper without parsing anything.
 
+### Running a whole agent confined
+
+`shell` runs an agent — Claude Code, Codex, or anything else — and every process it
+starts inside one kernel sandbox. Nothing outside the workspace is written, whatever
+permission mode the agent is in and whether or not any hook is configured:
+
+```bash
+claude setup-token        # once, outside: a session cannot reach the Keychain
+export CLAUDE_CODE_OAUTH_TOKEN=...
+./target/release/shellguard shell -w ~/project -- claude
+
+# Codex sandboxes its own commands, which macOS will not nest inside a session:
+./target/release/shellguard shell -w ~/project -- codex --sandbox danger-full-access
+```
+
+In a session the workspace and the agent's own state are writable, and nothing else
+is; `~/.ssh`, `~/.aws`, browser profiles and the other places that hold secrets are
+unreadable; environment variables that look like credentials are removed (the
+agent's own are kept); the SSH agent and container daemons (Docker, OrbStack,
+Colima, Podman) are unreachable; `.git/hooks` stays read-only, so nothing is planted
+for you to run later. Outbound network stays open — the agent needs it — so a session
+limits what can be *changed*, not what can be *sent*. `--dry-run` prints the profile,
+and `shellguard shell --help` lists the switches. macOS only for now; see
+[DESIGN.md § 19](DESIGN.md#19-wrapping-a-whole-agent).
+
 ## Latency
 
 M2 MacBook Air, release build, 42 400 samples over the 212-command corpus:

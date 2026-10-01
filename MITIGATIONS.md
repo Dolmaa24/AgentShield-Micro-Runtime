@@ -196,6 +196,13 @@ execute inside it and return real output — not before.
 
 ### 8. Eval-only hook wiring is a false sense of security
 
+**Status: (b) built for macOS.** `shellguard shell -- <agent>` confines the whole
+agent process tree, chosen over tool substitution because it does not depend on the
+agent's hooks or settings. Verified against the kernel with a stand-in agent,
+including the red-team routes (hard links, `launchctl`, `defaults`, Apple Events);
+the real-agent red-team waits on renewed logins. Design and measured facts are in
+[DESIGN.md § 19](DESIGN.md#19-wrapping-a-whole-agent). The original plan follows.
+
 **The fix — reject the eval-only shape entirely.** `shellguard eval` judges;
 it doesn't confine or checkpoint. Two real options, not one:
 
@@ -220,6 +227,10 @@ write outside the workspace even when the verdict was `allow`.
 
 ### 9. Fail-open on hook malfunction
 
+**Status: moot in the chosen design.** A `shellguard shell` session has no hook to
+malfunction: the kernel profile is applied before the agent starts, or it does not
+start.
+
 **The fix.** First, resolve the actual unknown rather than build around a
 guess — check Claude Code's documented hook exit-code semantics before
 wiring anything. Then, independent of what the default turns out to be, make
@@ -232,6 +243,10 @@ matter.
 and confirms the next Bash call is blocked, not silently allowed.
 
 ### 10. Hook only covers the Bash tool
+
+**Status: closed by #8(b).** The agent's own file tools run in the agent's process,
+which is inside the session; a write outside the workspace is refused whichever tool
+makes it.
 
 Same fix as item 8(b) — process-tree confinement constrains every syscall the
 `claude` process makes, not just the ones behind a Bash tool call.
@@ -250,6 +265,10 @@ defend against on the policy side.
 the string executed are asserted byte-identical.
 
 ### 12. Env-scrubbing breaks legitimate workflows
+
+**Status: the silence is addressed for sessions.** `shellguard shell` removes
+variables that look like credentials and names every one it removed in its banner;
+`--keep-env NAME` keeps one. The per-command runtime's hints are not built.
 
 **The fix.** This is intended behavior, not a bug — the risk is *silent*
 breakage, not the scrubbing itself. Mitigate the silence: detect the common
@@ -276,6 +295,9 @@ stop being an in-process-only claim.
 against the current cold-spawn baseline, published rather than asserted.
 
 ### 14. `settings.json` is an unaudited trust root
+
+**Status: closed by #8(b).** The session does not read or depend on the agent's
+settings, so removing or editing them changes nothing about what it can write.
 
 **The fix.** Two layers. The audit log (item 8/4) records at startup whether
 hook wiring is even active, so a silently-removed hook shows up as a gap in
