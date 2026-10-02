@@ -176,6 +176,115 @@ pub fn looks_like_credential(name: &str) -> bool {
     .any(|w| n.contains(w))
 }
 
+/// `~/.npmrc` with the lines that carry credentials left out, and how many were.
+///
+/// Sealing the file outright was measured to do harm: npm does not fail, it falls
+/// back to the public registry, and a private scope (`@corp:registry=…`) resolves
+/// as `undefined` — so `npm install @corp/x` would fetch whatever the public
+/// registry holds under that name. A copy with the registries and without the
+/// credentials keeps every package coming from where it should, and an install
+/// that needs a credential fails loudly instead.
+///
+/// A credential line is one whose key, after any `//host/path/:` scope, is
+/// `_auth` or looks like a credential (`_authToken`, `_password`). One whose value
+/// only names an environment variable (`${NPM_TOKEN}`) is kept: it holds nothing,
+/// and the variable itself is removed from the session unless the person keeps it.
+pub fn npmrc_without_credentials(text: &str) -> (String, usize) {
+    let mut out = String::with_capacity(text.len());
+    let mut dropped = 0;
+    for line in text.lines() {
+        let credential = match line.split_once('=') {
+            Some((key, value)) if !line.trim_start().starts_with(['#', ';']) => {
+                let key = key.trim();
+                let name = key.rsplit(':').next().unwrap_or(key);
+                let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+                let names_a_variable =
+                    value.strip_prefix("${").and_then(|v| v.strip_suffix('}')).is_some_and(|v| {
+                        !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    });
+                (name == "_auth" || looks_like_credential(name)) && !names_a_variable
+            }
+            _ => false,
+        };
+        if credential {
+            dropped += 1;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    (out, dropped)
+}
+
+/// Shell startup files, relative to the home directory (or to `$ZDOTDIR` for
+/// zsh's). A session can read them: sealing them was measured to cost whatever
+/// they put on `PATH`, silently in zsh.
+pub const STARTUP_FILES: &[&str] = &[
+    ".zshenv",
+    ".zprofile",
+    ".zshrc",
+    ".zlogin",
+    ".bashrc",
+    ".bash_profile",
+    ".profile",
+    ".config/fish/config.fish",
+];
+
+/// The names of credential-looking variables a shell startup file sets to a value
+/// written in the file — `export GITHUB_TOKEN=ghp_…` — rather than one fetched when
+/// the shell starts (`$(gh auth token)`, `$(security …)`), which leaves nothing in
+/// the file. Names only: values are never returned.
+///
+/// Lines that begin with an assignment: sh, bash and zsh (`export`, `typeset -x`,
+/// `declare -x`, `readonly`, or none), fish's `set -x`, and csh's `setenv`. One
+/// inside an `if` on the same line is not seen; this warns, it does not seal.
+pub fn credentials_set_in(script: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for line in script.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let mut words = line.split_whitespace().peekable();
+        let (name, value) = match words.peek().copied() {
+            // fish: set [-g|-U|-x...] NAME VALUE
+            Some("set") => {
+                words.next();
+                let mut rest = words.skip_while(|w| w.starts_with('-'));
+                match (rest.next(), rest.next()) {
+                    (Some(n), Some(v)) => (n, v),
+                    _ => continue,
+                }
+            }
+            Some("setenv") => {
+                words.next();
+                match (words.next(), words.next()) {
+                    (Some(n), Some(v)) => (n, v),
+                    _ => continue,
+                }
+            }
+            _ => {
+                let mut rest = words.skip_while(|w| {
+                    matches!(*w, "export" | "typeset" | "declare" | "readonly" | "local")
+                        || w.starts_with('-')
+                });
+                match rest.next().and_then(|w| w.split_once('=')) {
+                    Some((n, v)) => (n, v),
+                    None => continue,
+                }
+            }
+        };
+        let value = value.trim_start_matches(['"', '\'']);
+        let literal = !value.is_empty() && !value.starts_with(['$', '`']);
+        let is_name =
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if is_name && literal && looks_like_credential(name) && !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
 impl AgentProfile {
     /// The profile for running `program` in `workspace`, for a person whose home
     /// is `home`, with `tmp` as the session's private temporary directory.
@@ -312,6 +421,75 @@ mod tests {
         }
         assert!(agent_credentials("/x/claude").contains(&"CLAUDE_CODE_OAUTH_TOKEN"));
         assert!(agent_credentials("bash").is_empty());
+    }
+
+    #[test]
+    fn an_npmrc_keeps_its_registries_and_loses_its_credentials() {
+        let text = "\
+; a comment, kept
+registry=https://registry.example.test/
+@corp:registry=https://npm.corp.example.test/
+//npm.corp.example.test/:_authToken=SECRET-ONE
+//npm.corp.example.test/:always-auth=true
+//other.example.test/:_password = \"SECRET-TWO\"
+//other.example.test/:username=someone
+_auth=SECRET-THREE\r
+//env.example.test/:_authToken=${NPM_TOKEN}
+# _authToken=not-a-line
+";
+        let (copy, dropped) = npmrc_without_credentials(text);
+        assert_eq!(dropped, 3);
+        for secret in ["SECRET-ONE", "SECRET-TWO", "SECRET-THREE"] {
+            assert!(!copy.contains(secret), "{secret} survived:\n{copy}");
+        }
+        for kept in [
+            "; a comment, kept",
+            "@corp:registry=https://npm.corp.example.test/",
+            "registry=https://registry.example.test/",
+            "//npm.corp.example.test/:always-auth=true",
+            "//other.example.test/:username=someone",
+            "//env.example.test/:_authToken=${NPM_TOKEN}",
+            "# _authToken=not-a-line",
+        ] {
+            assert!(copy.lines().any(|l| l == kept), "{kept} was dropped:\n{copy}");
+        }
+        assert_eq!(npmrc_without_credentials("registry=https://r.test/\n").1, 0);
+        // `${...}` with anything else in it is a value, not a reference.
+        assert_eq!(npmrc_without_credentials("//h/:_authToken=${A}SECRET\n").1, 1);
+    }
+
+    #[test]
+    fn startup_files_are_read_for_credentials_written_in_them_and_never_for_values() {
+        let script = r#"
+export GITHUB_TOKEN=ghp_literal
+export NPM_TOKEN="quoted-literal"
+OPENAI_API_KEY='single'
+typeset -x DB_PASSWORD=hunter2
+declare -gx AWS_SECRET_ACCESS_KEY=abc
+set -gx FISH_TOKEN fishvalue
+setenv CSH_TOKEN cshvalue
+export GITHUB_TOKEN=again
+export GH_TOKEN=$(gh auth token)
+export FETCHED_TOKEN="$(security find-generic-password -w -s x)"
+export REF_TOKEN=$OTHER
+export TICK_TOKEN=`cat f`
+export EMPTY_TOKEN=
+export PATH="$HOME/bin:$PATH"
+export EDITOR=vim
+# export COMMENTED_TOKEN=x
+"#;
+        assert_eq!(
+            credentials_set_in(script),
+            [
+                "GITHUB_TOKEN",
+                "NPM_TOKEN",
+                "OPENAI_API_KEY",
+                "DB_PASSWORD",
+                "AWS_SECRET_ACCESS_KEY",
+                "FISH_TOKEN",
+                "CSH_TOKEN"
+            ]
+        );
     }
 
     #[test]

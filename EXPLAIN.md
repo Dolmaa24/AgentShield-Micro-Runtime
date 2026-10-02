@@ -206,9 +206,11 @@ What else a session does:
 
 - Your secrets are hidden: `~/.ssh`, `~/.aws`, browser profiles, your shell history,
   another agent's login and so on can't be read, and passwords or tokens in your
-  environment are removed before the agent starts (it keeps its own). Two places
-  stay readable, because hiding them breaks things: `~/.npmrc` and your shell's
-  startup files (`~/.zshrc` and friends). Don't keep tokens in them.
+  environment are removed before the agent starts (it keeps its own). npm still
+  gets your registry settings, just not the tokens in `~/.npmrc`. Your shell's
+  startup files (`~/.zshrc` and friends) stay readable, because hiding them breaks
+  your `PATH`; if one has a token written in it, the session tells you which one,
+  by name, when it starts.
 - It can't borrow your SSH keys through the SSH agent, or ask Docker to do something
   for it (Docker can reach your whole disk).
 - It can't plant a git hook in your project that would run the next time *you*

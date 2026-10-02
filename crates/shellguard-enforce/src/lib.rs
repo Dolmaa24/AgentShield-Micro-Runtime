@@ -43,8 +43,8 @@ mod profile;
 mod syscalls;
 
 pub use agent::{
-    agent_credentials, looks_like_credential, AgentProfile, CONTAINER_SOCKET_DIRS, SECRET_DIRS,
-    SECRET_FILES,
+    agent_credentials, credentials_set_in, looks_like_credential, npmrc_without_credentials,
+    AgentProfile, CONTAINER_SOCKET_DIRS, SECRET_DIRS, SECRET_FILES, STARTUP_FILES,
 };
 pub use profile::{Access, EnforceError, FsGrant, Profile};
 pub use syscalls::DENIED as DENIED_SYSCALLS;

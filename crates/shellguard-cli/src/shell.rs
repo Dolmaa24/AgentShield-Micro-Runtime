@@ -146,7 +146,26 @@ pub fn cmd_shell(args: impl Iterator<Item = String>) -> Result<ExitCode, String>
     profile.secret_prefixes.retain(|s| !given_back.iter().any(|g| g == s));
     profile.secret_dirs.extend(o.secret.iter().cloned());
     profile.mach_services.extend(o.allow_mach.iter().cloned());
-    let (env, removed) = session_env(&program, &o.keep_env, o.allow_ssh_agent);
+    let (mut env, removed) = session_env(&program, &o.keep_env, o.allow_ssh_agent);
+
+    // npm's user configuration, without its credentials: the original sealed, and
+    // npm pointed at a copy in the session's temp directory.
+    let npmrc = npm_userconfig(&home)
+        .filter(|f| {
+            let real = f.canonicalize().unwrap_or_else(|_| f.clone());
+            !given_back.iter().any(|g| *g == real || g == f)
+        })
+        .and_then(|f| {
+            let text = std::fs::read_to_string(&f).ok()?;
+            let (copy, dropped) = shellguard_enforce::npmrc_without_credentials(&text);
+            (dropped > 0).then_some((f, copy, dropped))
+        });
+    if let Some((original, _, _)) = &npmrc {
+        profile.secret_dirs.push(original.clone());
+        env.retain(|(k, _)| !k.eq_ignore_ascii_case("NPM_CONFIG_USERCONFIG"));
+        env.push(("NPM_CONFIG_USERCONFIG".into(), tmp.join("npmrc").into()));
+    }
+    let in_startup_files = credentials_in_startup_files(&home);
     if o.allow_ssh_agent {
         profile.block_ssh_agent = false;
     } else if let Some(sock) = std::env::var_os("SSH_AUTH_SOCK") {
@@ -208,13 +227,29 @@ pub fn cmd_shell(args: impl Iterator<Item = String>) -> Result<ExitCode, String>
                 removed.join(", ")
             ));
         }
+        if let Some((original, _, dropped)) = &npmrc {
+            text.push_str(&format!(
+                "  npm:        {} is given without its {dropped} credential line{}\n",
+                tilde(original, &home),
+                if *dropped == 1 { "" } else { "s" }
+            ));
+        }
+        for (file, names) in &in_startup_files {
+            text.push_str(&format!(
+                "  warning:    {} sets {} in the file itself, and a session can read it.\n\
+                 \x20             Fetch it when the shell starts instead, e.g.\n\
+                 \x20             `export NAME=$(security find-generic-password -w -s NAME)`.\n",
+                tilde(file, &home),
+                names.join(", ")
+            ));
+        }
         text
     };
 
     #[cfg(not(target_os = "macos"))]
     {
         // The launch and its hints are macOS's; see the error below.
-        let _ = (&summary, &o.args, &env, login_hint, sandbox_hint);
+        let _ = (&summary, &o.args, &env, &npmrc, login_hint, sandbox_hint);
         Err("`shell` needs the macOS backend. On Linux it is not built yet: Landlock grants \
              access and cannot take it back, so a home directory cannot be readable while the \
              secrets in it are not, and that is the shape this mode is."
@@ -234,6 +269,10 @@ pub fn cmd_shell(args: impl Iterator<Item = String>) -> Result<ExitCode, String>
         }
         std::fs::create_dir_all(&tmp)
             .map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+        if let Some((_, copy, _)) = &npmrc {
+            std::fs::write(tmp.join("npmrc"), copy)
+                .map_err(|e| format!("cannot write the session's npmrc: {e}"))?;
+        }
         let argv = shellguard_enforce::macos::agent_command(&profile, &program, &o.args)
             .map_err(|e| e.to_string())?;
         if !o.quiet {
@@ -250,6 +289,38 @@ pub fn cmd_shell(args: impl Iterator<Item = String>) -> Result<ExitCode, String>
         let status = status?;
         Ok(exit_code(status))
     }
+}
+
+/// Where npm reads its user configuration: `NPM_CONFIG_USERCONFIG` (in any case,
+/// as npm reads it) if set, otherwise `~/.npmrc`.
+fn npm_userconfig(home: &Path) -> Option<PathBuf> {
+    let set = std::env::vars_os()
+        .find(|(k, _)| k.eq_ignore_ascii_case("NPM_CONFIG_USERCONFIG"))
+        .map(|(_, v)| PathBuf::from(v));
+    let f = set.unwrap_or_else(|| home.join(".npmrc"));
+    f.is_file().then_some(f)
+}
+
+/// Each shell startup file that sets a credential-looking variable to a value
+/// written in it, with the names. Read here, outside the session; the values are
+/// never kept.
+fn credentials_in_startup_files(home: &Path) -> Vec<(PathBuf, Vec<String>)> {
+    let mut files: Vec<PathBuf> =
+        shellguard_enforce::STARTUP_FILES.iter().map(|f| home.join(f)).collect();
+    if let Some(z) = std::env::var_os("ZDOTDIR").map(PathBuf::from) {
+        for f in [".zshenv", ".zprofile", ".zshrc", ".zlogin"] {
+            if !files.contains(&z.join(f)) {
+                files.push(z.join(f));
+            }
+        }
+    }
+    files
+        .into_iter()
+        .filter_map(|f| {
+            let names = shellguard_enforce::credentials_set_in(&std::fs::read_to_string(&f).ok()?);
+            (!names.is_empty()).then_some((f, names))
+        })
+        .collect()
 }
 
 /// The environment the session starts with: this one, less every variable whose

@@ -263,3 +263,74 @@ fn another_agents_login_and_history_kept_elsewhere_are_unreadable() {
     assert!(out.contains("MCP-KEYS"), "--allow-secret did not give it back: {out}");
     assert!(!out.contains("TYPED-TOKEN"));
 }
+
+/// `shellguard shell [opts] -- /bin/sh -c script`, with the variables that would
+/// point npm or zsh somewhere else removed, so the fixture's files are the ones read.
+fn shell_clean(fx: &Fixture, opts: &[&str], script: &str) -> (String, String) {
+    let out = Command::new(BIN)
+        .arg("shell")
+        .arg("-w")
+        .arg(fx.p("ws"))
+        .args(opts)
+        .args(["--", "/bin/sh", "-c", script])
+        .env("HOME", fx.p("home"))
+        .env_remove("NPM_CONFIG_USERCONFIG")
+        .env_remove("npm_config_userconfig")
+        .env_remove("ZDOTDIR")
+        .output()
+        .unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn npm_keeps_its_registries_and_not_its_credentials() {
+    let fx = Fixture::new("npmrc");
+    std::fs::write(
+        fx.p("home/.npmrc"),
+        "@corp:registry=https://npm.corp.example.test/\n//npm.corp.example.test/:_authToken=NPM-SECRET\n",
+    )
+    .unwrap();
+    let npm =
+        Command::new("/bin/sh").args(["-c", "command -v npm"]).output().unwrap().status.success();
+    let script = "cat \"$HOME/.npmrc\"; echo \"copy: $(cat \"$NPM_CONFIG_USERCONFIG\")\"; \
+                  command -v npm >/dev/null && echo \"npm says: $(npm config get @corp:registry)\"";
+
+    let (out, err) = shell_clean(&fx, &[], script);
+    assert!(!out.contains("NPM-SECRET"), "the credential reached the session:\n{out}");
+    assert!(out.contains("copy: @corp:registry=https://npm.corp.example.test/"), "{out}\n{err}");
+    if npm {
+        // The point of the copy: the private scope still resolves to its own registry.
+        assert!(out.contains("npm says: https://npm.corp.example.test/"), "{out}\n{err}");
+    } else {
+        eprintln!("npm is not installed; checked the copy, not npm reading it");
+    }
+    assert!(err.contains("npm:") && err.contains("without its 1 credential line"), "{err}");
+
+    // Given back, it is the original, read as it is.
+    let npmrc = fx.p("home/.npmrc").display().to_string();
+    let (out, err) = shell_clean(&fx, &["--allow-secret", &npmrc], script);
+    assert!(out.contains("NPM-SECRET"), "--allow-secret did not give it back:\n{out}");
+    assert!(!err.contains("npm:"), "{err}");
+}
+
+#[test]
+fn a_credential_written_in_a_startup_file_is_named_and_never_shown() {
+    let fx = Fixture::new("startup");
+    std::fs::write(
+        fx.p("home/.zshrc"),
+        "export FAKE_TOKEN=s3cr3t-value\nexport FETCHED_TOKEN=$(gh auth token)\nexport EDITOR=vim\n",
+    )
+    .unwrap();
+    let (out, err) = shell_clean(&fx, &[], "true");
+    let warning: Vec<&str> = err.lines().filter(|l| l.contains("warning:")).collect();
+    assert_eq!(warning.len(), 1, "{err}");
+    assert!(warning[0].contains("~/.zshrc sets FAKE_TOKEN in the file itself"), "{err}");
+    assert!(!(out.clone() + &err).contains("s3cr3t-value"), "a value was printed:\n{err}");
+    assert!(!err.contains("FETCHED_TOKEN"), "a fetched value is not in the file:\n{err}");
+
+    let (_, err) = shell_clean(&fx, &["-q"], "true");
+    assert!(err.is_empty(), "{err}");
+}

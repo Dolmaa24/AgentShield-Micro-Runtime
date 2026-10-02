@@ -1340,6 +1340,23 @@ would be sealing one door of two:
 - the SSH agent is unreachable (launchd's socket by pattern, plus whatever
   `SSH_AUTH_SOCK` names) — with `~/.ssh` unreadable it was the remaining way to use
   the keys;
+- npm's user configuration is given without its credentials. Sealing `~/.npmrc`
+  outright was measured to do harm: npm does not fail, it falls back to the public
+  registry — asked for `@corp/pkg` with `@corp:registry=…` sealed away, it sent
+  `GET https://registry.npmjs.org/@corp%2fpkg`, which is how a dependency-confusion
+  attack gets its package installed. So the original is sealed and npm is pointed
+  (`NPM_CONFIG_USERCONFIG`) at a copy in the session's temp directory with every
+  credential line left out: the same request goes to the private registry, and an
+  install that needs the token fails there, loudly. A line whose value only names a
+  variable (`${NPM_TOKEN}`) is kept, as it holds nothing. Only when there is a
+  credential line to leave out; `--allow-secret ~/.npmrc` gives the original back.
+  pnpm, yarn and bun were not installed on the test machine: whether they follow
+  `NPM_CONFIG_USERCONFIG`, or find `~/.npmrc` sealed and fall back as npm did, is
+  not measured;
+- shell startup files stay readable: sealed, zsh skips them silently and bash prints
+  an error, and whatever they put on `PATH` is gone (measured). Instead the banner
+  names each credential-looking variable a startup file sets to a value written in
+  it — `export GITHUB_TOKEN=ghp_…`, not `$(gh auth token)` — by name, never by value;
 - container daemons' sockets are unreachable (Docker Desktop, OrbStack, Colima, Lima,
   Rancher, Podman, `DOCKER_HOST`): a daemon that will run `-v /:/host` for any client
   is a way out of every rule here, and a socket connect is not a write. The kernel
@@ -1360,12 +1377,8 @@ run once they are renewed. Outbound network is open, so a session limits what ca
 changed, not what can be sent. Persistence inside the workspace beyond `.git/hooks` —
 `.git/config` keys that run programs, `package.json` scripts, a `Makefile`, `.envrc`
 — is writable, and runs when the person next uses the project outside a session.
-Two kinds of file that can hold tokens stay readable, because sealing them was measured
-to do harm: with `~/.npmrc` sealed, npm does not fail — it falls back to the public
-registry, and a private scope (`@corp:registry=…`) resolved as `undefined`, which is
-how a dependency-confusion attack gets its package installed; with the shell startup
-files sealed (`~/.zshrc`, `~/.zprofile`, `~/.bashrc`), zsh skips them silently and
-bash prints an error, and whatever they put on `PATH` is gone. The agent's own
+A token written in a shell startup file is readable in a session: the banner names it,
+and that is all. The agent's own
 credential, kept in the environment by design, is in the environment of every command
 it runs. Linux is not built: Landlock grants access and cannot take it back, so a readable home
 with unreadable secrets in it cannot be expressed. Claude Code's own sandbox setting,

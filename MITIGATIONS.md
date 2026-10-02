@@ -214,9 +214,11 @@ agent's hooks or settings. Verified against the kernel with a stand-in agent,
 including the red-team routes (hard links, `launchctl`, `defaults`, Apple Events);
 the real-agent red-team waits on renewed logins. Closed since: a session could read
 other agents' logins (`~/.codex/auth.json` from Claude, and the reverse) and the
-person's shell history; both are now unreadable. Still readable, by measurement:
-`~/.npmrc` (sealed, npm silently falls back to the public registry for a private
-scope) and the shell startup files (sealed, what they put on `PATH` is lost). Design and measured facts are in
+person's shell history; both are now unreadable. `~/.npmrc` is sealed and npm gets a
+copy without its credentials (sealed with no copy, npm was measured asking the public
+registry for a private scope). Shell startup files stay readable (sealed, what they
+put on `PATH` is lost); the banner names any credential written in one. Design and
+measured facts are in
 [DESIGN.md § 19](DESIGN.md#19-wrapping-a-whole-agent). The original plan follows.
 
 **The fix — reject the eval-only shape entirely.** `shellguard eval` judges;
