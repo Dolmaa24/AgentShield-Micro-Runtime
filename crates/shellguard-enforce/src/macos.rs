@@ -360,12 +360,15 @@ pub fn agent_sbpl(p: &AgentProfile) -> Result<String, EnforceError> {
     s.push_str("(deny default)\n");
 
     s.push_str("(allow file-read*)\n");
-    if !p.secret_dirs.is_empty() {
+    if !p.secret_dirs.is_empty() || !p.secret_prefixes.is_empty() {
         // Contents and listings, not existence: denying `stat` breaks tools that
         // only check whether a directory is there.
         s.push_str("(deny file-read-data file-read-xattr\n");
         for d in &p.secret_dirs {
             s.push_str(&format!("  (subpath {})\n", path_string(&real(d))?));
+        }
+        for f in &p.secret_prefixes {
+            s.push_str(&format!("  (regex {})\n", sbpl_prefix_regex(&real(f))?));
         }
         s.push_str(")\n");
     }
@@ -962,9 +965,12 @@ mod agent_session_tests {
         }
         /// (exit status, stdout+stderr) of `script`, sandboxed or not.
         fn run(&self, script: &str, sandboxed: bool) -> (bool, String) {
+            self.run_in(&self.profile(), script, sandboxed)
+        }
+        fn run_in(&self, profile: &AgentProfile, script: &str, sandboxed: bool) -> (bool, String) {
             let mut c = if sandboxed {
-                let argv = agent_command(&self.profile(), "/bin/sh", &["-c".into(), script.into()])
-                    .unwrap();
+                let argv =
+                    agent_command(profile, "/bin/sh", &["-c".into(), script.into()]).unwrap();
                 let mut c = Command::new(&argv[0]);
                 c.args(&argv[1..]);
                 c
@@ -1055,6 +1061,41 @@ mod agent_session_tests {
         // Existence is not a secret: tools look before they read.
         fx.allowed("test -d \"$HOME/.ssh\"");
         fx.allowed("cat \"$HOME/notes.txt\" >/dev/null && ls \"$HOME\" >/dev/null");
+    }
+
+    #[test]
+    fn another_agents_login_and_the_persons_history_cannot_be_read() {
+        let fx = Fixture::new("others");
+        for (f, text) in [
+            ("home/.codex/auth.json", "CODEX LOGIN"),
+            ("home/.claude/.credentials.json", "CLAUDE LOGIN"),
+            ("home/.claude.json", "MCP KEYS"),
+            ("home/.claude.json.backup", "MCP KEYS"),
+            ("home/.zsh_history", "export TOKEN=1"),
+            ("home/.zsh_sessions/A.history", "export TOKEN=2"),
+        ] {
+            std::fs::create_dir_all(fx.p(f).parent().unwrap()).unwrap();
+            std::fs::write(fx.p(f), text).unwrap();
+        }
+        // Claude's session: Codex's login and the history, but its own state reads.
+        fx.refused("cat \"$HOME/.codex/auth.json\"");
+        fx.refused("cat \"$HOME/.zsh_history\"");
+        fx.refused("cat \"$HOME/.zsh_sessions/A.history\"");
+        fx.allowed("cat \"$HOME/.claude/.credentials.json\" \"$HOME/.claude.json\" >/dev/null");
+
+        // Codex's session: Claude's login, its configuration and the backups of it.
+        let codex = AgentProfile::for_program("codex", &fx.p("ws"), &fx.p("home"), &fx.p("tmp"));
+        for script in [
+            "cat \"$HOME/.claude/.credentials.json\"",
+            "cat \"$HOME/.claude.json\"",
+            "cat \"$HOME/.claude.json.backup\"",
+        ] {
+            assert!(fx.run_in(&codex, script, false).0, "control failed: {script}");
+            let (ok, out) = fx.run_in(&codex, script, true);
+            assert!(!ok, "codex's session read: {script}\n{out}");
+        }
+        let (ok, out) = fx.run_in(&codex, "cat \"$HOME/.codex/auth.json\"", true);
+        assert!(ok && out.contains("CODEX LOGIN"), "codex could not read its own login: {out}");
     }
 
     #[test]

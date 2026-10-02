@@ -102,8 +102,9 @@ export CLAUDE_CODE_OAUTH_TOKEN=...
 ```
 
 In a session the workspace and the agent's own state are writable, and nothing else
-is; `~/.ssh`, `~/.aws`, browser profiles and the other places that hold secrets are
-unreadable; environment variables that look like credentials are removed (the
+is; `~/.ssh`, `~/.aws`, browser profiles, shell history, other agents' logins and the
+other places that hold secrets are unreadable (`~/.npmrc` and shell startup files are
+not — see [DESIGN.md § 19](DESIGN.md#19-wrapping-a-whole-agent)); environment variables that look like credentials are removed (the
 agent's own are kept); the SSH agent and container daemons (Docker, OrbStack,
 Colima, Podman) are unreachable; `.git/hooks` stays read-only, so nothing is planted
 for you to run later. Outbound network stays open — the agent needs it — so a session

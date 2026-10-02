@@ -132,7 +132,18 @@ pub fn cmd_shell(args: impl Iterator<Item = String>) -> Result<ExitCode, String>
     profile.write_dirs.extend(o.write.iter().cloned());
     let given_back: Vec<PathBuf> =
         o.allow_secret.iter().map(|p| p.canonicalize().unwrap_or_else(|_| p.clone())).collect();
+    // History kept somewhere other than the default, where the environment says.
+    let elsewhere = [
+        std::env::var_os("HISTFILE").map(PathBuf::from),
+        std::env::var_os("ZDOTDIR").map(|z| PathBuf::from(z).join(".zsh_history")),
+    ];
+    for h in elsewhere.into_iter().flatten() {
+        if !profile.secret_dirs.contains(&h) {
+            profile.secret_dirs.push(h);
+        }
+    }
     profile.secret_dirs.retain(|s| !given_back.iter().any(|g| g == s));
+    profile.secret_prefixes.retain(|s| !given_back.iter().any(|g| g == s));
     profile.secret_dirs.extend(o.secret.iter().cloned());
     profile.mach_services.extend(o.allow_mach.iter().cloned());
     let (env, removed) = session_env(&program, &o.keep_env, o.allow_ssh_agent);
@@ -182,10 +193,10 @@ pub fn cmd_shell(args: impl Iterator<Item = String>) -> Result<ExitCode, String>
             (false, _) => "none",
         };
         let mut text = format!(
-            "shellguard: {program} is confined to {}\n  writable:   {}\n  unreadable: {} places that hold secrets (~/.ssh, ~/.aws, ...)\n  frozen:     {}\n  network:    {network}\n  ssh agent:  {}\n  containers: {}\n",
+            "shellguard: {program} is confined to {}\n  writable:   {}\n  unreadable: {} places that hold secrets (~/.ssh, ~/.aws, shell history, other agents' logins, ...)\n  frozen:     {}\n  network:    {network}\n  ssh agent:  {}\n  containers: {}\n",
             tilde(&workspace, &home),
             writable.join(", "),
-            profile.secret_dirs.len(),
+            profile.unreadable_count(),
             profile.frozen_dirs.iter().map(|d| tilde(d, &home)).collect::<Vec<_>>().join(", "),
             if profile.block_ssh_agent { "blocked" } else { "allowed" },
             if profile.blocked_socket_dirs.is_empty() { "daemons reachable" } else { "daemons blocked" },
@@ -288,8 +299,9 @@ fn login_hint(program: &str, env: &[(OsString, OsString)]) -> Option<&'static st
         {
             Some(
                 "  login:      Claude Code keeps its login in the Keychain, which a session cannot\n\
-                 \x20             reach. Run `claude setup-token` once, outside, and export\n\
-                 \x20             CLAUDE_CODE_OAUTH_TOKEN before starting the session.",
+                 \x20             reach. Run `claude setup-token` once, outside, and set\n\
+                 \x20             CLAUDE_CODE_OAUTH_TOKEN in the terminal that starts the session,\n\
+                 \x20             not in a startup file: other sessions can read those.",
             )
         }
         _ => None,

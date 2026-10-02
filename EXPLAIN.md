@@ -204,9 +204,11 @@ service. All refused.
 
 What else a session does:
 
-- Your secrets are hidden: `~/.ssh`, `~/.aws`, browser profiles and so on can't be
-  read, and passwords or tokens in your environment are removed before the agent
-  starts (it keeps its own).
+- Your secrets are hidden: `~/.ssh`, `~/.aws`, browser profiles, your shell history,
+  another agent's login and so on can't be read, and passwords or tokens in your
+  environment are removed before the agent starts (it keeps its own). Two places
+  stay readable, because hiding them breaks things: `~/.npmrc` and your shell's
+  startup files (`~/.zshrc` and friends). Don't keep tokens in them.
 - It can't borrow your SSH keys through the SSH agent, or ask Docker to do something
   for it (Docker can reach your whole disk).
 - It can't plant a git hook in your project that would run the next time *you*

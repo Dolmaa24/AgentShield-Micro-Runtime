@@ -36,6 +36,10 @@ pub struct AgentProfile {
     /// Their existence can still be seen: denying `stat` breaks tools that only
     /// look.
     pub secret_dirs: Vec<PathBuf>,
+    /// Files whose contents cannot be read, together with anything whose path
+    /// begins the same way: another agent's `~/.claude.json` and the backups
+    /// written beside it.
+    pub secret_prefixes: Vec<PathBuf>,
     /// Subtrees of the workspace that stay read-only. `.git/hooks` by default: a
     /// hook planted there runs, unconfined, the next time the *person* commits.
     pub frozen_dirs: Vec<PathBuf>,
@@ -93,11 +97,36 @@ pub const SECRET_DIRS: &[&str] = &[
     "Library/Application Support/BraveSoftware",
     "Library/Application Support/Microsoft Edge",
     "Library/Group Containers/2BUA8C4S2C.com.1password",
+    // GitHub Copilot's login, which no agent here needs.
+    ".config/github-copilot",
+    // Terminal's per-window shell history.
+    ".zsh_sessions",
 ];
 
 /// Single files that hold credentials, relative to the home directory.
-pub const SECRET_FILES: &[&str] =
-    &[".netrc", ".git-credentials", ".pypirc", ".vault-token", ".cargo/credentials.toml"];
+///
+/// Shell and REPL history among them: a token typed or pasted on a command line
+/// stays there, and no agent needs to read what the person typed before.
+pub const SECRET_FILES: &[&str] = &[
+    ".netrc",
+    ".git-credentials",
+    ".pypirc",
+    ".vault-token",
+    ".cargo/credentials.toml",
+    ".zsh_history",
+    ".bash_history",
+    ".local/share/fish/fish_history",
+    ".python_history",
+    ".node_repl_history",
+    ".irb_history",
+    ".psql_history",
+    ".mysql_history",
+    ".sqlite_history",
+    ".rediscli_history",
+];
+
+/// The agents whose state [`AgentProfile::for_program`] knows.
+pub const KNOWN_AGENTS: &[&str] = &["claude", "codex", "gemini"];
 
 /// What a known agent writes outside the workspace, relative to the home
 /// directory: (directories, file prefixes).
@@ -153,6 +182,11 @@ impl AgentProfile {
     ///
     /// Known agents (`claude`, `codex`, `gemini`) also get their own state
     /// directories. Anything else gets the workspace and `tmp` and nothing more.
+    ///
+    /// Every *other* known agent's state is unreadable: it holds that agent's
+    /// login (`~/.codex/auth.json`), and its configuration can hold more
+    /// (`~/.claude.json` keeps the environment of each MCP server, API keys
+    /// included).
     pub fn for_program(program: &str, workspace: &Path, home: &Path, tmp: &Path) -> AgentProfile {
         let base = Path::new(program).file_name().and_then(|n| n.to_str()).unwrap_or(program);
         let (dirs, prefixes) = agent_state(base);
@@ -160,11 +194,18 @@ impl AgentProfile {
         write_dirs.push(tmp.to_path_buf());
         let mut secret_dirs: Vec<PathBuf> = SECRET_DIRS.iter().map(|d| home.join(d)).collect();
         secret_dirs.extend(SECRET_FILES.iter().map(|f| home.join(f)));
+        let mut secret_prefixes = Vec::new();
+        for other in KNOWN_AGENTS.iter().filter(|a| **a != base) {
+            let (dirs, prefixes) = agent_state(other);
+            secret_dirs.extend(dirs.iter().map(|d| home.join(d)));
+            secret_prefixes.extend(prefixes.iter().map(|p| home.join(p)));
+        }
         AgentProfile {
             workspace: workspace.to_path_buf(),
             write_dirs,
             write_prefixes: prefixes.iter().map(|p| home.join(p)).collect(),
             secret_dirs,
+            secret_prefixes,
             frozen_dirs: vec![workspace.join(".git/hooks")],
             allow_network: true,
             allow_local_listen: true,
@@ -173,6 +214,11 @@ impl AgentProfile {
             blocked_sockets: Vec::new(),
             blocked_socket_dirs: CONTAINER_SOCKET_DIRS.iter().map(|d| home.join(d)).collect(),
         }
+    }
+
+    /// How many places the session cannot read, for a summary a person can read.
+    pub fn unreadable_count(&self) -> usize {
+        self.secret_dirs.len() + self.secret_prefixes.len()
     }
 
     /// Every path the session may write, for a summary a person can read.
@@ -216,6 +262,37 @@ mod tests {
     }
 
     #[test]
+    fn other_agents_logins_and_the_persons_history_are_unreadable() {
+        let home = Path::new("/h");
+        let profile =
+            |agent| AgentProfile::for_program(agent, Path::new("/w"), home, Path::new("/t"));
+        let codex = profile("/opt/bin/codex");
+        for d in [".claude", ".local/state/claude", ".gemini"] {
+            assert!(codex.secret_dirs.contains(&home.join(d)), "{d}");
+        }
+        assert_eq!(codex.secret_prefixes, [home.join(".claude.json")]);
+        assert!(!codex.secret_dirs.contains(&home.join(".codex")));
+
+        let claude = profile("claude");
+        assert!(claude.secret_dirs.contains(&home.join(".codex")));
+        assert!(claude.secret_dirs.contains(&home.join(".gemini")));
+        assert!(claude.secret_prefixes.is_empty());
+
+        // Anything that is not one of them reads none of them.
+        let bash = profile("bash");
+        for d in [".claude", ".codex", ".gemini"] {
+            assert!(bash.secret_dirs.contains(&home.join(d)), "{d}");
+        }
+        assert_eq!(bash.secret_prefixes, [home.join(".claude.json")]);
+
+        for p in [codex, claude, bash] {
+            for h in [".zsh_history", ".bash_history", ".zsh_sessions", ".python_history"] {
+                assert!(p.secret_dirs.contains(&home.join(h)), "{h}");
+            }
+        }
+    }
+
+    #[test]
     fn credential_names_are_recognised_and_ordinary_ones_are_not() {
         for n in [
             "GITHUB_TOKEN",
@@ -238,16 +315,23 @@ mod tests {
     }
 
     #[test]
-    fn no_secret_overlaps_an_agent_state_directory() {
+    fn no_secret_overlaps_the_agents_own_state() {
         // If one did, the agent could not read its own state, or the state
-        // directory would hand out a secret.
-        for agent in ["claude", "codex", "gemini"] {
-            let (dirs, prefixes) = agent_state(agent);
-            for s in SECRET_DIRS.iter().chain(SECRET_FILES) {
-                for d in dirs.iter().chain(prefixes) {
+        // directory would hand out a secret. Compared by path component, as the
+        // sandbox compares, and by string prefix for the prefix rules.
+        let home = Path::new("/h");
+        for agent in KNOWN_AGENTS {
+            let p = AgentProfile::for_program(agent, Path::new("/w"), home, Path::new("/t"));
+            let secret = p.secret_dirs.iter().chain(&p.secret_prefixes);
+            for s in secret {
+                for own in p.write_dirs.iter().chain(&p.write_prefixes) {
+                    let (s_text, own_text) = (s.to_string_lossy(), own.to_string_lossy());
                     assert!(
-                        !s.starts_with(d) && !d.starts_with(s),
-                        "{agent}: secret `{s}` overlaps state `{d}`"
+                        !s.starts_with(own)
+                            && !own.starts_with(s)
+                            && !s_text.starts_with(&*own_text)
+                            && !own_text.starts_with(&*s_text),
+                        "{agent}: secret {s:?} overlaps its own state {own:?}"
                     );
                 }
             }

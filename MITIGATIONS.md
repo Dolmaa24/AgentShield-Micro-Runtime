@@ -10,13 +10,17 @@ know it actually worked** — because a fix nobody verified is just a
 differently-shaped version of the same problem this project keeps calling out
 in other tools.
 
-Nothing here is built yet. This is the "how", written before the "do it".
+This was written before any of it was built, as the "how" before the "do it". Each
+entry now opens with its status.
 
 ---
 
 ## Part 1 — the limitations already on record
 
 ### 1. Overlayfs rollback is unimplemented
+
+**Status: not built.** It runs only on Linux, and there has been no Linux host to
+verify it on.
 
 **The fix.** Add `crates/shellguard-runtime/src/overlay.rs`: mount the
 workspace read-only as `lowerdir`, point `upperdir`/`workdir` at a scratch
@@ -36,6 +40,9 @@ the overlay backend instead of the git backend, and only then does DESIGN.md
 get to stop saying "unimplemented."
 
 ### 2. The warm pool isn't wired to a VM backend
+
+**Status: not built.** It needs a guest kernel downloaded, which waits on your
+sign-off (below).
 
 **The fix.** Implement the `Warm` trait for `VzRuntime`: `boot()` launches
 `vzrunner` in `run` mode against a guest image and blocks on the vsock
@@ -128,6 +135,8 @@ chain), and it records only what goes through the engine.
 
 ### 5. No cgroups
 
+**Status: not built.** Linux only, and there has been no Linux host to verify it on.
+
 **The fix.** `crates/shellguard-enforce/src/linux/cgroup.rs`. Before the
 child is spawned, create a per-execution cgroup under a shellguard-owned
 parent (`/sys/fs/cgroup/shellguard/<exec-id>/`), write `memory.max`,
@@ -178,6 +187,9 @@ Where it went beyond or away from the plan, and why:
 
 ### 7. Three of four backends are unverified end to end
 
+**Status: not built.** VZ and Firecracker need the guest from item 2; gVisor needs a
+Linux host.
+
 **The fix.** One guest build (from item 2), reused across all three:
 
 | Backend | What's missing | Where it can actually be checked |
@@ -200,7 +212,11 @@ execute inside it and return real output — not before.
 agent process tree, chosen over tool substitution because it does not depend on the
 agent's hooks or settings. Verified against the kernel with a stand-in agent,
 including the red-team routes (hard links, `launchctl`, `defaults`, Apple Events);
-the real-agent red-team waits on renewed logins. Design and measured facts are in
+the real-agent red-team waits on renewed logins. Closed since: a session could read
+other agents' logins (`~/.codex/auth.json` from Claude, and the reverse) and the
+person's shell history; both are now unreadable. Still readable, by measurement:
+`~/.npmrc` (sealed, npm silently falls back to the public registry for a private
+scope) and the shell startup files (sealed, what they put on `PATH` is lost). Design and measured facts are in
 [DESIGN.md § 19](DESIGN.md#19-wrapping-a-whole-agent). The original plan follows.
 
 **The fix — reject the eval-only shape entirely.** `shellguard eval` judges;
@@ -253,6 +269,11 @@ Same fix as item 8(b) — process-tree confinement constrains every syscall the
 
 ### 11. Judge/run string mismatch (TOCTOU)
 
+**Status: moot for sessions; holds for `run` but no test pins it.** A session judges
+nothing, so nothing can differ. `shellguard run` and the C API judge a string and run
+that same string — `execute_with_rollback` hands it to `sh -c` as one argument, never
+re-quoted — but the property test below is not written.
+
 **The fix.** Never re-quote or reconstruct the command between judgment and
 execution. Pass the exact bytes Claude Code's Bash tool received as a single
 argument or over a length-prefixed pipe — the same wire pattern `vzrunner`
@@ -283,6 +304,9 @@ var produces a stderr message naming the likely cause, not just a raw
 tool error.
 
 ### 13. Per-call process spawn cost
+
+**Status: moot in the chosen design.** The cost is a process per hook call, and a
+session has no hook. The gate's in-process latency is measured in the README.
 
 **The fix.** Don't spawn `shellguard` fresh per Bash call. Run a long-lived
 `shellguard serve` daemon over a Unix socket, wrapping the same `Gate` +

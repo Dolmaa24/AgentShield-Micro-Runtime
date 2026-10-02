@@ -221,3 +221,45 @@ fn the_ssh_agent_is_unreachable_unless_allowed() {
     assert!(out.contains("connected"), "--allow-ssh-agent did not allow it\n{out}{err}");
     assert!(out.starts_with(&sock.display().to_string()));
 }
+
+#[test]
+fn another_agents_login_and_history_kept_elsewhere_are_unreadable() {
+    let fx = Fixture::new("others");
+    for (f, text) in [
+        ("home/.codex/auth.json", "CODEX-LOGIN"),
+        ("home/.claude.json", "MCP-KEYS"),
+        ("home/hist/custom", "TYPED-TOKEN"),
+    ] {
+        std::fs::create_dir_all(fx.p(f).parent().unwrap()).unwrap();
+        std::fs::write(fx.p(f), text).unwrap();
+    }
+    // A stand-in named `codex`, so it gets Codex's profile.
+    std::fs::create_dir_all(fx.p("bin")).unwrap();
+    let codex = fx.p("bin/codex");
+    std::fs::write(&codex, "#!/bin/sh\nfor f in \"$@\"; do cat \"$f\" 2>/dev/null; echo; done\n")
+        .unwrap();
+    std::fs::set_permissions(&codex, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let run = |opts: &[&str]| {
+        let out = Command::new(BIN)
+            .args(["shell", "-q", "-w"])
+            .arg(fx.p("ws"))
+            .args(opts)
+            .arg("--")
+            .arg(&codex)
+            .args([".codex/auth.json", ".claude.json", "hist/custom"].map(|f| fx.p("home").join(f)))
+            .env("HOME", fx.p("home"))
+            .env("HISTFILE", fx.p("home/hist/custom"))
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let out = run(&[]);
+    assert!(out.contains("CODEX-LOGIN"), "codex could not read its own login: {out}");
+    assert!(!out.contains("MCP-KEYS"), "codex read Claude's configuration: {out}");
+    assert!(!out.contains("TYPED-TOKEN"), "the history HISTFILE names was readable: {out}");
+
+    let claude_json = fx.p("home/.claude.json").display().to_string();
+    let out = run(&["--allow-secret", &claude_json]);
+    assert!(out.contains("MCP-KEYS"), "--allow-secret did not give it back: {out}");
+    assert!(!out.contains("TYPED-TOKEN"));
+}

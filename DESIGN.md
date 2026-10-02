@@ -1295,7 +1295,7 @@ refusal so it is noticed if a macOS release lifts it.
 
 | | per command | whole session |
 |---|---|---|
-| reads | system runtime and the workspace | everything, except 29 places that hold secrets |
+| reads | system runtime and the workspace | everything, except 41 places that hold secrets and every other agent's state |
 | writes | the workspace, if granted | the workspace, the agent's state, a private temp dir |
 | network | only if a rule granted it | outbound, and listening on localhost |
 | Mach services | an allowlist of two | the same allowlist |
@@ -1326,6 +1326,15 @@ their accounts, in a scratch workspace):
 **Closing the other doors.** Sealing secret files while leaving secrets elsewhere
 would be sealing one door of two:
 
+- every *other* known agent's state is unreadable, and so is the person's shell and
+  REPL history. Found by a probe in a fixture home: a Claude session could read
+  `~/.codex/auth.json`, a Codex session `~/.claude/.credentials.json`, and both the
+  history files. `~/.claude.json` is sealed with the backups written beside it
+  (`~/.claude.json.backup`), because it keeps each MCP server's environment, API keys
+  included. History kept elsewhere is found where the environment says (`HISTFILE`,
+  `$ZDOTDIR/.zsh_history`). The agent's own state stays readable, and a test checks
+  no sealed path overlaps it;
+
 - environment variables whose names look like credentials are removed, except the
   agent's own, and the banner names each one removed;
 - the SSH agent is unreachable (launchd's socket by pattern, plus whatever
@@ -1351,6 +1360,13 @@ run once they are renewed. Outbound network is open, so a session limits what ca
 changed, not what can be sent. Persistence inside the workspace beyond `.git/hooks` —
 `.git/config` keys that run programs, `package.json` scripts, a `Makefile`, `.envrc`
 — is writable, and runs when the person next uses the project outside a session.
-Linux is not built: Landlock grants access and cannot take it back, so a readable home
+Two kinds of file that can hold tokens stay readable, because sealing them was measured
+to do harm: with `~/.npmrc` sealed, npm does not fail — it falls back to the public
+registry, and a private scope (`@corp:registry=…`) resolved as `undefined`, which is
+how a dependency-confusion attack gets its package installed; with the shell startup
+files sealed (`~/.zshrc`, `~/.zprofile`, `~/.bashrc`), zsh skips them silently and
+bash prints an error, and whatever they put on `PATH` is gone. The agent's own
+credential, kept in the environment by design, is in the environment of every command
+it runs. Linux is not built: Landlock grants access and cannot take it back, so a readable home
 with unreadable secrets in it cannot be expressed. Claude Code's own sandbox setting,
 if enabled, would fail to nest the same way Codex's does.
